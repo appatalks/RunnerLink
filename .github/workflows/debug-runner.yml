@@ -10,6 +10,10 @@ on:
         description: 'Max session lifetime in seconds'
         required: false
         default: '3600'
+      TUNNEL_PORT:
+        description: 'Gateway reverse tunnel port to expose for this runner (2222-2231)'
+        required: false
+        default: '2222'
 
 jobs:
   ssh-debug:
@@ -69,10 +73,12 @@ jobs:
           GATEWAY_PORT: ${{ secrets.GATEWAY_PORT }}
           GATEWAY_USER: ${{ secrets.GATEWAY_USER }}
           MAX_LIFETIME: ${{ github.event.inputs.MAX_LIFETIME }}
+          TUNNEL_PORT: ${{ github.event.inputs.TUNNEL_PORT }}
         run: |
           # Write private key directly from secret (preserves formatting)
           echo "$GATEWAY_PRIVATE_KEY" > /tmp/gateway_key
           chmod 400 /tmp/gateway_key
+          trap 'rm -f /tmp/gateway_key' EXIT
           
           # Verify key format
           if ! ssh-keygen -l -f /tmp/gateway_key >/dev/null 2>&1; then
@@ -82,45 +88,86 @@ jobs:
           
           echo "Private key loaded successfully ($(ssh-keygen -l -f /tmp/gateway_key | awk '{print $1, $4}'))"
           
-          # Use a different port for the reverse tunnel (2222) to avoid conflict with gateway SSH
-          TUNNEL_PORT=2222
-          
-          echo "::notice::Establishing reverse tunnel: gateway:${TUNNEL_PORT} -> localhost:22"
-          echo "::notice::To connect to this runner, use: ssh -p ${TUNNEL_PORT} runner@${GATEWAY_HOST}"
-          echo "::notice::Connection will remain open for ${MAX_LIFETIME} seconds"
-          
-          # Establish reverse tunnel and keep it alive
-          ssh -o StrictHostKeyChecking=no \
-              -o ConnectTimeout=15 \
-              -o ConnectionAttempts=1 \
-              -o IdentitiesOnly=yes \
-              -o ServerAliveInterval=60 \
-              -o ServerAliveCountMax=3 \
-              -o ExitOnForwardFailure=yes \
-              -i /tmp/gateway_key \
-              -p ${GATEWAY_PORT} \
-              -R ${TUNNEL_PORT}:localhost:22 \
-              -N \
-              ${GATEWAY_USER}@${GATEWAY_HOST} &
-          
-          SSH_PID=$!
-          echo "Reverse tunnel established (PID: $SSH_PID)"
-          
-          # Wait a moment for tunnel to establish
-          sleep 5
-          
-          # Check if SSH process is still running
-          if ! kill -0 $SSH_PID 2>/dev/null; then
-            echo "::error::Reverse tunnel failed to establish"
-            echo "::error::Check gateway host/port reachability, router forwarding, the private key, and authorized_keys"
+          if ! [[ "$TUNNEL_PORT" =~ ^[0-9]+$ ]] || [ "$TUNNEL_PORT" -lt 2222 ] || [ "$TUNNEL_PORT" -gt 2231 ]; then
+            echo "::error::TUNNEL_PORT must be in the published gateway range 2222-2231"
+            exit 1
+          fi
+
+          if ! [[ "$MAX_LIFETIME" =~ ^[0-9]+$ ]] || [ "$MAX_LIFETIME" -le 0 ]; then
+            echo "::error::MAX_LIFETIME must be a positive number of seconds"
             exit 1
           fi
           
-          echo "::notice::Tunnel is active! Keeping connection alive for ${MAX_LIFETIME} seconds..."
+          echo "::notice::Establishing reverse tunnel: gateway:${TUNNEL_PORT} -> localhost:22"
+          echo "::notice::To connect to this runner, use: ssh -p ${TUNNEL_PORT} runner@<gateway-host>"
+          echo "::notice::Connection will remain open for ${MAX_LIFETIME} seconds"
           
-          # Keep job alive for MAX_LIFETIME
-          sleep "$MAX_LIFETIME"
-          
-          # Clean up
-          echo "::notice::Max lifetime reached. Closing tunnel..."
-          kill $SSH_PID 2>/dev/null || true
+          deadline=$((SECONDS + 10#$MAX_LIFETIME))
+          attempt=1
+          consecutive_failures=0
+          max_failures=12
+          reconnect_delay=10
+          max_reconnect_delay=60
+          stable_after=60
+
+          echo "::notice::Tunnel supervisor active for ${MAX_LIFETIME} seconds"
+
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            remaining=$((deadline - SECONDS))
+            attempt_started=$SECONDS
+            echo "::notice::Opening reverse tunnel attempt ${attempt} (${remaining}s remaining)"
+
+            if ssh -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=15 \
+                -o ConnectionAttempts=1 \
+                -o IdentitiesOnly=yes \
+                -o ServerAliveInterval=60 \
+                -o ServerAliveCountMax=3 \
+                -o ExitOnForwardFailure=yes \
+                -i /tmp/gateway_key \
+                -p "${GATEWAY_PORT}" \
+                -R "${TUNNEL_PORT}:localhost:22" \
+                -N \
+                "${GATEWAY_USER}@${GATEWAY_HOST}"; then
+              ssh_status=0
+            else
+              ssh_status=$?
+            fi
+
+            connected_for=$((SECONDS - attempt_started))
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              break
+            fi
+
+            if [ "$ssh_status" -eq 0 ] || [ "$connected_for" -ge "$stable_after" ]; then
+              consecutive_failures=0
+              reconnect_delay=10
+            else
+              consecutive_failures=$((consecutive_failures + 1))
+            fi
+
+            if [ "$consecutive_failures" -ge "$max_failures" ]; then
+              echo "::error::Reverse tunnel failed ${consecutive_failures} times in a row"
+              echo "::error::Check gateway host/port reachability, router forwarding, the private key, and authorized_keys"
+              exit 1
+            fi
+
+            echo "::warning::Reverse tunnel exited with status ${ssh_status} after ${connected_for}s; reconnecting in ${reconnect_delay}s"
+            remaining=$((deadline - SECONDS))
+            sleep_for=$reconnect_delay
+            if [ "$sleep_for" -gt "$remaining" ]; then
+              sleep_for=$remaining
+            fi
+            if [ "$sleep_for" -gt 0 ]; then
+              sleep "$sleep_for"
+            fi
+            attempt=$((attempt + 1))
+            if [ "$reconnect_delay" -lt "$max_reconnect_delay" ]; then
+              reconnect_delay=$((reconnect_delay * 2))
+              if [ "$reconnect_delay" -gt "$max_reconnect_delay" ]; then
+                reconnect_delay=$max_reconnect_delay
+              fi
+            fi
+          done
+
+          echo "::notice::Max lifetime reached. Tunnel supervisor exiting..."

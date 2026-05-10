@@ -7,11 +7,11 @@ This repository enables SSH access to GitHub-hosted runners using a Docker-based
 GitHub-hosted runners cannot accept inbound SSH connections. The solution uses a **reverse SSH tunnel**:
 
 1. **Gateway Server** (Docker container) - SSH server on your local machine
-2. **GitHub Runner** - Connects to gateway with reverse tunnel: `-R 2222:localhost:22`
-3. **You** - SSH to gateway port 2222, which tunnels through to the GitHub runner
+2. **GitHub Runner** - Connects to gateway with reverse tunnel: `-R [tunnel-port]:localhost:22`
+3. **You** - SSH to the matching gateway tunnel port, which tunnels through to the GitHub runner
 
 ```
-Your Machine → ssh gateway:2222 → (reverse tunnel) → GitHub Runner:22
+Your Machine → ssh gateway:[2222-2231] → (reverse tunnel) → GitHub Runner:22
 ```
 
 ## Setup
@@ -32,7 +32,7 @@ docker compose logs -f gateway
 
 The gateway will listen on:
 - **Port 50556** - Gateway SSH (for GitHub runner to connect)
-- **Port 2222** - Reverse tunnel endpoint (for you to connect to runner)
+- **Ports 2222-2231** - Reverse tunnel endpoints (for you to connect to runners)
 
 ### 2. Configure Router Port Forwarding
 
@@ -41,7 +41,7 @@ For GitHub runners and your connections to reach the gateway, expose both ports:
 1. Find your local IP: `ip addr show | grep "inet "`
 2. Configure your router to forward both ports:
    - External Port: **50556** → Internal IP: **[your-local-ip]** → Internal Port: **50556** (for GitHub runner to connect)
-   - External Port: **2222** → Internal IP: **[your-local-ip]** → Internal Port: **2222** (for you to connect to runner)
+   - External Ports: **2222-2231** → Internal IP: **[your-local-ip]** → Internal Ports: **2222-2231** (for you to connect to runners)
 3. Get your public IP: `curl icanhazip.com`
 
 ### 3. Set Up GitHub Secrets
@@ -70,6 +70,7 @@ Drop `debug-runner.yml` into `.github/workflows/`. (Optionally add your custom s
 3. Provide these inputs:
    - **SSH_PUBLIC_KEY**: Your local public key (e.g., `cat ~/.ssh/id_rsa.pub`) or use test key: `cat test-assets/id_rsa_test.pub`
    - **MAX_LIFETIME**: How long to keep tunnel open in seconds (default: 3600)
+   - **TUNNEL_PORT**: Gateway reverse tunnel port for this runner (default: 2222, supported range: 2222-2231)
 4. Click **Run workflow**
 
 ### 5. Connect to the GitHub Runner
@@ -110,6 +111,11 @@ ssh -i test-assets/id_rsa_test -p 50556 -o IdentitiesOnly=yes gateway@localhost
 - Check the workflow is still running (tunnel only exists while job is active)
 - Connect to port **2222** not 50556: `ssh -p 2222 runner@...`
 
+### Multiple runner workstreams
+- Start each workflow run with a unique `TUNNEL_PORT` in the published range, such as 2222, 2223, or 2224.
+- Connect to the matching port for that runner: `ssh -p 2223 runner@...`
+- The helper widget in `helper-widget/` can launch, probe, and cancel workstreams from a small native Linux/macOS UI.
+
 ### Workflow tunnel fails to establish
 - Verify GitHub Secrets are set correctly
 - Check gateway logs: `docker logs debug-runner-gateway-1 --tail 50`
@@ -121,9 +127,9 @@ ssh -i test-assets/id_rsa_test -p 50556 -o IdentitiesOnly=yes gateway@localhost
 2. **GitHub Workflow**: 
    - Installs SSH server on the GitHub runner
    - Adds your public key to runner's `authorized_keys`
-   - Opens reverse tunnel: `ssh -R 2222:localhost:22 gateway@your-gateway`
+   - Opens reverse tunnel: `ssh -R [tunnel-port]:localhost:22 gateway@your-gateway`
    - Keeps job alive for MAX_LIFETIME seconds
-3. **You Connect**: SSH to gateway's port 2222, which forwards through the tunnel to the runner
+3. **You Connect**: SSH to the matching gateway tunnel port, which forwards through to the runner
 
 ## Files
 
@@ -138,11 +144,21 @@ ssh -i test-assets/id_rsa_test -p 50556 -o IdentitiesOnly=yes gateway@localhost
 
 The SSH server is configured with:
 - Port 50555 (internal) → 50556 (external host port)
-- Port 2222 (reverse tunnel endpoint)
+- Ports 2222-2231 (reverse tunnel endpoints)
 - `GatewayPorts yes` - Allows reverse tunnels
 - `AllowTcpForwarding yes` - Enables TCP forwarding
 - Public key authentication only (no passwords)
 - User: `gateway`
+
+## Helper Widget
+
+Run the native Linux/macOS helper widget locally:
+
+```bash
+python3 helper-widget/runner_widget.py
+```
+
+The widget provides toggles for the Docker bridge, multiple runner workstreams, and modular tool auth checks for GitHub, GitHub Copilot CLI, Azure CLI, and Azure Data Explorer. Customize workstreams and tool modules by copying `helper-widget/config.example.json` to `helper-widget/config.json`.
 
 ## Screenshot
 

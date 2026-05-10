@@ -30,7 +30,7 @@ GitHub runner -> gateway public host port 50556 -> gateway container port 50555
 - Runner user: `runner`
 - Gateway SSH host port: `50556`
 - Gateway SSH container port: `50555`
-- Reverse tunnel host/container port: `2222`
+- Reverse tunnel host/container port range: `2222-2231`
 - Runner SSH target: `localhost:22`
 - Local test key: `test-assets/id_rsa_test`
 - Gateway authorized keys file: `authorized_keys`
@@ -93,7 +93,8 @@ GitHub runner -> gateway public host port 50556 -> gateway container port 50555
    ```bash
    gh workflow run debug-runner.yml \
      -f SSH_PUBLIC_KEY="$(cat test-assets/id_rsa_test.pub)" \
-     -f MAX_LIFETIME=3600
+     -f MAX_LIFETIME=3600 \
+     -f TUNNEL_PORT=2222
    ```
 
 7. Track the run.
@@ -126,7 +127,9 @@ GitHub runner -> gateway public host port 50556 -> gateway container port 50555
 
 ## Optional Runner Tooling
 
-Install GitHub Copilot CLI on the runner as the `gh-copilot` extension only after the tunnel works.
+Use GitHub Copilot CLI on the runner only after the tunnel works. Prefer the helper widget's Copilot Setup button, which opens the selected runner shell with `gh copilot` so the user can approve any GitHub CLI prompt directly. Do not automate Copilot prompt approval or handle Copilot auth tokens through chat.
+
+If working by hand, run the same command in the runner shell:
 
 ```bash
 ssh -i test-assets/id_rsa_test -p 2222 \
@@ -134,29 +137,39 @@ ssh -i test-assets/id_rsa_test -p 2222 \
   -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=no \
   -o UserKnownHostsFile=/dev/null \
-  runner@localhost 'bash -s' <<'REMOTE_SCRIPT'
-set -u
-if ! command -v gh >/dev/null 2>&1; then
-  echo 'gh is not installed on the runner'
-  exit 2
-fi
-if gh extension list 2>/dev/null | awk '{print $1}' | grep -Fxq 'gh-copilot'; then
-  gh extension upgrade gh-copilot || true
-else
-  gh extension install github/gh-copilot
-fi
-gh copilot --help | head -n 60
-REMOTE_SCRIPT
+  runner@localhost 'gh copilot'
 ```
 
-Using `gh copilot` may require the runner to authenticate with a GitHub account or token that has Copilot access. Do not handle that token through chat.
+Using `gh copilot` may require the runner to authenticate with a GitHub account or token that has Copilot access.
+
+## Helper Widget
+
+Use the native Linux/macOS helper widget when the user wants a desktop control surface for the bridge, multiple runner workstreams, and modular tool auth checks.
+
+```bash
+python3 helper-widget/runner_widget.py
+```
+
+The widget reads workstreams and tool modules from `helper-widget/config.example.json`, or from ignored local file `helper-widget/config.json` if present. Do not store tokens or passwords in either file. Interactive auth for GitHub, Copilot, Azure, or Azure Data Explorer should happen directly in a trusted terminal or selected runner shell.
+
+The default runner is `main` on reverse tunnel port `2222`. Use Add Runner in the widget to create additional named runners; names are normalized, ports are auto-assigned from `2222-2231`, the updated workstream list is saved atomically to ignored `helper-widget/config.json`, and the runner starts immediately. Auto-assigned ports are based on local config only, so probe after starting a runner to confirm the gateway port is free.
+
+Tool Setup remains non-interactive except for Copilot. Azure CLI and Azure Data Explorer Setup install or repair command modules only; Fix starts `az login --use-device-code --allow-no-subscriptions` in a runner shell and polls the selected runner until the check reports ready or a setup problem. Azure/ADX checks should print one friendly status line such as `azure ready`, `adx ready`, `needs login`, or `kusto missing`, never raw Azure JSON.
+
+The docked `xterm` uses conservative geometry and does not live-resize perfectly inside Tk. If it clips after resizing, close and dock it again, or use the external terminal fallback. A future package can replace this with a proper VTE/Tauri terminal surface.
+
+Runner rows do not use start toggles. Add Runner starts additional named runners immediately, and Probe starts the default `main` runner when no run is linked yet. Use the explicit workstream stop button or sessions picker Cancel button to call `gh run cancel`.
+
+The sessions picker refreshes active workflow runs, resumes a selected run against the currently selected workstream/port, and cancels only the selected run. GitHub's run list does not expose the `TUNNEL_PORT` input, so choose the workstream that owns the port before resuming. To keep one runner alive while starting another, start a different workstream with a different tunnel port; two live tunnels cannot share the same reverse-forward port.
+
+Current workflow runs supervise the reverse SSH tunnel and reconnect with capped backoff until `MAX_LIFETIME` expires. Older runs that predate this reconnecting workflow can still appear `in_progress` after a gateway restart even though their tunnel is gone.
 
 ## Troubleshooting Cues
 
 - Local gateway SSH fails on 50556: rebuild the gateway and confirm `authorized_keys` exists before build.
 - Public gateway SSH fails with connection refused: check firewall, router forwarding, Docker port publishing, and current public IP.
 - Workflow hangs before tunnel readiness: add or confirm SSH `ConnectTimeout` and `ConnectionAttempts`; inspect gateway logs for an accepted `gateway` public key.
-- Port 2222 refuses or resets: verify the workflow is still in the tunnel step and that the gateway has an active reverse listener.
+- Port 2222 refuses or resets: verify the workflow is still in the tunnel step and that the gateway has an active reverse listener. If the gateway restarted, an older run may still be alive while its tunnel is gone; start a fresh session on a free port or cancel the stale run.
 - `gh run view --log` may not show live logs while a job is in progress; use gateway logs and an SSH probe to check readiness.
 - Cancel stuck or finished debug runs with `gh run cancel <run-id>`.
 
@@ -174,7 +187,7 @@ Using `gh copilot` may require the runner to authenticate with a GitHub account 
 
 - Add a wrapper script for setup, secret refresh, workflow run, and tunnel probing.
 - Add a cleanup script for canceling the run and stopping the gateway.
-- Add a workflow input for tunnel port if 2222 is already in use.
+- Package the helper widget as a macOS menu bar app or Linux tray app if the Python/Tk prototype becomes too limited.
 - Add `actionlint` and `shellcheck` to CI.
 - Add a short `TESTING.md` with local, public, and GitHub-runner verification paths.
 - Add a preflight command that reports firewall/router readiness without revealing public IPs.

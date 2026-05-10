@@ -8,3 +8,4 @@ tmp
 test-assets/id_rsa_test
 test-assets/id_rsa_test.pub
 ssh-server
+helper-widget

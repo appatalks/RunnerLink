@@ -24,6 +24,6 @@ RUN chown -R gateway:gateway /home/gateway/.ssh && \
     chmod 700 /home/gateway/.ssh && \
     chmod 600 /home/gateway/.ssh/authorized_keys
 
-EXPOSE 50555
+EXPOSE 50555 2222-2231
 
 CMD ["/usr/sbin/sshd", "-D", "-e"]
