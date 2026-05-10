@@ -91,6 +91,8 @@ jobs:
           
           # Establish reverse tunnel and keep it alive
           ssh -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=15 \
+              -o ConnectionAttempts=1 \
               -o IdentitiesOnly=yes \
               -o ServerAliveInterval=60 \
               -o ServerAliveCountMax=3 \
@@ -110,7 +112,7 @@ jobs:
           # Check if SSH process is still running
           if ! kill -0 $SSH_PID 2>/dev/null; then
             echo "::error::Reverse tunnel failed to establish"
-            echo "::error::Check that the gateway private key is correct and authorized_keys is configured"
+            echo "::error::Check gateway host/port reachability, router forwarding, the private key, and authorized_keys"
             exit 1
           fi
           

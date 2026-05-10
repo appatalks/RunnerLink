@@ -19,6 +19,9 @@ Your Machine → ssh gateway:2222 → (reverse tunnel) → GitHub Runner:22
 ### 1. Start the Docker Gateway
 
 ```bash
+# Generate the local test key and gateway authorized_keys file
+bash ./test-assets/generate-keys.sh
+
 # Build and start the gateway container
 docker compose up --build -d
 
@@ -74,7 +77,7 @@ Drop `debug-runner.yml` into `.github/workflows/`. (Optionally add your custom s
 Once the workflow shows "Tunnel is active!", connect:
 
 ```bash
-# Generate and uising test key
+# Generate and use the test key
 bash ./test-assets/generate-keys.sh
 ssh -i test-assets/id_rsa_test -p 2222 -o IdentitiesOnly=yes -o UserKnownHostsFile=/dev/null runner@[YOUR_PUBLIC_IP]
 
@@ -126,7 +129,7 @@ ssh -i test-assets/id_rsa_test -p 50556 -o IdentitiesOnly=yes gateway@localhost
 
 - `Dockerfile` - SSH gateway server (Ubuntu 22.04 + OpenSSH)
 - `docker-compose.yml` - Gateway service with port mappings
-- `authorized_keys` - Public keys authorized to connect to gateway
+- `authorized_keys` - Generated public keys authorized to connect to gateway
 - `.github/workflows/debug-runner.yml` - GitHub Actions workflow for reverse tunnel
 - `test-assets/` - Test SSH keys and key generation script
 - `TESTING.md` - Comprehensive testing and troubleshooting guide

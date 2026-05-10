@@ -1,0 +1,4 @@
+test-assets/id_rsa_test
+test-assets/id_rsa_test.pub
+authorized_keys
+ssh-server/
