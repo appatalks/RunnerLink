@@ -40,7 +40,7 @@ AZ_PROFILE_PATCH_SCRIPT = (
     "tid=$(python3 -c \""
     "import json, os; "
     "p = os.path.expanduser('~/.azure/msal_token_cache.json'); "
-    "d = json.load(open(p)); "
+    "d = json.load(open(p, encoding='utf-8-sig')); "
     "at = next(iter(d.get('AccessToken', {}).values()), {}); "
     "print(at.get('realm', '').strip())\" 2>/dev/null); "
     "if [ -z \"$tid\" ]; then tid=$(az rest --url https://graph.microsoft.com/v1.0/organization "
@@ -49,7 +49,7 @@ AZ_PROFILE_PATCH_SCRIPT = (
     "python3 -c \""
     "import json, os; "
     "p = os.path.expanduser('~/.azure/azureProfile.json'); "
-    "d = json.load(open(p)); "
+    "d = json.load(open(p, encoding='utf-8-sig')); "
     "d['subscriptions'] = [{"
     "'id': '00000000-0000-0000-0000-000000000000', "
     "'name': 'No Subscription', "
@@ -59,7 +59,7 @@ AZ_PROFILE_PATCH_SCRIPT = (
     "'environmentName': 'AzureCloud', "
     "'user': {'name': 'device-code', 'type': 'user'}"
     "}]; "
-    "json.dump(d, open(p, 'w'), indent=2)\" "
+    "json.dump(d, open(p, 'w', encoding='utf-8-sig'), indent=2)\" "
     "&& echo '[widget] Profile patched — az commands should work now'; "
     "else echo '[widget] Could not determine tenant ID — manual patching may be needed'; fi; "
     "fi"
@@ -370,8 +370,7 @@ def load_config() -> WidgetConfig:
         )
         for item in raw_config.get("workstreams", [])
     ]
-    if not workstreams:
-        workstreams = [Workstream(name="main", branch="main", tunnel_port=2222, max_lifetime=21600)]
+    # No default workstream — users add runners via the app UI
     tools = [
         ToolModule(
             module_id=str(item["id"]),
@@ -998,7 +997,9 @@ class RunnerWidget:
             ttk.Label(row, textvariable=self.tool_status[tool.module_id], style="Status.TLabel", width=16).pack(side="left")
             self.icon_button(row, "probe", lambda item=tool: self.check_tool(item), f"Check {tool.label}", "primary").pack(side="left", padx=(4, 2))
             self.icon_button(row, "setup", lambda item=tool: self.install_tool(item), f"Set up {tool.label}").pack(side="left", padx=2)
-            if tool.module_id != "copilot":
+            if tool.module_id == "copilot":
+                self.icon_button(row, "fix", self.open_copilot_yolo_shell, "Launch Copilot CLI in yolo mode", "danger").pack(side="left", padx=2)
+            else:
                 self.icon_button(row, "fix", lambda item=tool: self.copy_auth_command(item), f"Fix or authenticate {tool.label}", "danger").pack(side="left", padx=2)
             self.set_tool_status(tool.module_id, "unknown")
 
@@ -2281,6 +2282,12 @@ class RunnerWidget:
         self.set_tool_status("copilot", "continue setup")
         self.log("Opened Copilot setup shell. Continue the gh copilot prompt in the terminal.")
 
+    def open_copilot_yolo_shell(self) -> None:
+        remote_command = "gh copilot -- --yolo"
+        self.open_embedded_terminal_shell(command_to_copy=remote_command, remote_command=remote_command)
+        self.set_tool_status("copilot", "yolo mode")
+        self.log("Launched Copilot CLI in yolo mode on the runner.")
+
     def disconnect_shell(self, log_message: bool = True) -> None:
         process = self.shell_process
         master_fd = self.shell_master_fd
@@ -2883,12 +2890,32 @@ def run_config_check() -> int:
     return 0
 
 
+def run_stop_all() -> int:
+    compose_file = REPO_ROOT / "docker-compose.yml"
+    if not compose_file.exists():
+        print("error: docker-compose.yml not found", file=sys.stderr)
+        return 1
+    print("Stopping RunnerLink gateway...")
+    result = subprocess.run(
+        ["docker", "compose", "-f", str(compose_file), "down"],
+        cwd=str(REPO_ROOT),
+    )
+    if result.returncode == 0:
+        print("RunnerLink gateway stopped and cleaned up.")
+    else:
+        print("error: docker compose down failed", file=sys.stderr)
+    return result.returncode
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Native helper widget for debug-hosted-runner")
     parser.add_argument("--check", action="store_true", help="validate widget config without opening the GUI")
+    parser.add_argument("-S", "--stopall", action="store_true", help="stop and tear down the gateway cleanly")
     args = parser.parse_args()
     if args.check:
         return run_config_check()
+    if args.stopall:
+        return run_stop_all()
 
     config = load_config()
     root = tk.Tk()

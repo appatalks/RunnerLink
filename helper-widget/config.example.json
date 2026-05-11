@@ -8,14 +8,7 @@
     "private_key_path": "test-assets/id_rsa_test",
     "public_key_path": "test-assets/id_rsa_test.pub"
   },
-  "workstreams": [
-    {
-      "name": "main",
-      "branch": "main",
-      "tunnel_port": 2222,
-      "max_lifetime": 21600
-    }
-  ],
+  "workstreams": [],
   "tools": [
     {
       "id": "github",
