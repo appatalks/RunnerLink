@@ -1,12 +1,19 @@
-<p align="center">
-  <img src="assets/RunnerLink.png" alt="RunnerLink" width="600" />
-</p>
+<table>
+<tr>
+<td width="55%">
+<img src="assets/RunnerLink.png" alt="RunnerLink" />
+</td>
+<td>
 
-# RunnerLink
+## RunnerLink
 
 **Your only Actions gateway.**
 
 RunnerLink gives you direct SSH access to GitHub-hosted runners through a reverse-tunnel gateway — from a single desktop app. Launch runners, dock interactive terminals, browse remote files, and manage tool authentication, all without leaving your local machine.
+
+</td>
+</tr>
+</table>
 
 ---
 
