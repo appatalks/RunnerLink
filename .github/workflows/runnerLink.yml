@@ -12,7 +12,7 @@ on:
       MAX_LIFETIME:
         description: 'Max session lifetime in seconds'
         required: false
-        default: '3600'
+        default: '21600'
       TUNNEL_PORT:
         description: 'Gateway reverse tunnel port to expose for this runner (2222-2231)'
         required: false
