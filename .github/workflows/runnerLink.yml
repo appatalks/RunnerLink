@@ -1,5 +1,8 @@
 name: RunnerLink Gateway
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -16,7 +19,7 @@ on:
         default: '2222'
 
 jobs:
-  ssh-debug:
+  runner-link-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Install requirements
