@@ -108,7 +108,7 @@ ssh -i test-assets/id_rsa_test -p 2222 -o StrictHostKeyChecking=no runner@<YOUR_
 │   ├── config.example.json         # Default configuration (tracked)
 │   └── config.json                 # Local overrides (gitignored)
 ├── .github/workflows/
-│   └── debug-runner.yml            # GitHub Actions reverse-tunnel workflow
+│   └── runnerLink.yml              # GitHub Actions reverse-tunnel workflow
 ├── Dockerfile                      # SSH gateway (Ubuntu 22.04 + OpenSSH)
 ├── docker-compose.yml              # Gateway service definition
 └── test-assets/

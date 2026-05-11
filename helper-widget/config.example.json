@@ -1,6 +1,6 @@
 {
   "repository": {
-    "workflow": "debug-runner.yml",
+    "workflow": "runnerLink.yml",
     "gateway_host_port": 50556,
     "gateway_user": "gateway",
     "gateway_secret_user": "gateway",

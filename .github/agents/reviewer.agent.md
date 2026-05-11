@@ -29,7 +29,7 @@ Apply high reasoning effort.
 This repository provides a Dockerized OpenSSH gateway for debugging GitHub-hosted runners through reverse SSH tunnels.
 - `Dockerfile` configures the gateway user, OpenSSH server, public-key authentication, and reverse-tunnel-friendly SSH settings.
 - `docker-compose.yml` exposes host ports 50556 and 2222.
-- `.github/workflows/debug-runner.yml` configures SSH on the hosted runner, installs the user's public key, opens the reverse tunnel, and keeps the workflow alive.
+- `.github/workflows/runnerLink.yml` configures SSH on the hosted runner, installs the user's public key, opens the reverse tunnel, and keeps the workflow alive.
 - `test-assets/generate-keys.sh` creates local test SSH keys and related test artifacts.
 - `README.md` is the operational contract for setup, GitHub secrets, router port forwarding, connection commands, and troubleshooting.
 

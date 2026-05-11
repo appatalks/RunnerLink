@@ -352,7 +352,7 @@ def load_config() -> WidgetConfig:
 
     repository_raw = raw_config["repository"]
     repository = RepositoryConfig(
-        workflow=repository_raw.get("workflow", "debug-runner.yml"),
+        workflow=repository_raw.get("workflow", "runnerLink.yml"),
         gateway_host_port=int(repository_raw.get("gateway_host_port", 50556)),
         gateway_user=repository_raw.get("gateway_user", "gateway"),
         gateway_secret_user=repository_raw.get("gateway_secret_user", "gateway"),
@@ -2434,7 +2434,7 @@ class RunnerWidget:
                 if workstream.tunnel_port != 2222:
                     raise RuntimeError(
                         "The pushed GitHub workflow does not support TUNNEL_PORT yet. "
-                        "Commit and push .github/workflows/debug-runner.yml before starting "
+                        "Commit and push .github/workflows/runnerLink.yml before starting "
                         f"the {workstream.name} workstream on port {workstream.tunnel_port}."
                     ) from error
                 run_process(workflow_args, timeout=60)

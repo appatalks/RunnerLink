@@ -34,7 +34,7 @@ GitHub runner -> gateway public host port 50556 -> gateway container port 50555
 - Runner SSH target: `localhost:22`
 - Local test key: `test-assets/id_rsa_test`
 - Gateway authorized keys file: `authorized_keys`
-- Workflow: `.github/workflows/debug-runner.yml`
+- Workflow: `.github/workflows/runnerLink.yml`
 
 ## Setup Workflow
 
@@ -91,7 +91,7 @@ GitHub runner -> gateway public host port 50556 -> gateway container port 50555
 6. Trigger the workflow.
 
    ```bash
-   gh workflow run debug-runner.yml \
+   gh workflow run runnerLink.yml \
      -f SSH_PUBLIC_KEY="$(cat test-assets/id_rsa_test.pub)" \
      -f MAX_LIFETIME=3600 \
      -f TUNNEL_PORT=2222
@@ -100,7 +100,7 @@ GitHub runner -> gateway public host port 50556 -> gateway container port 50555
 7. Track the run.
 
    ```bash
-   gh run list --workflow debug-runner.yml --limit 1 \
+   gh run list --workflow runnerLink.yml --limit 1 \
      --json databaseId,status,conclusion,createdAt,url,displayTitle
    ```
 
@@ -180,7 +180,7 @@ Current workflow runs supervise the reverse SSH tunnel and reconnect with capped
 - `docker compose config`
 - `docker compose build gateway`
 - `git diff --check`
-- `actionlint .github/workflows/debug-runner.yml` when available
+- `actionlint .github/workflows/runnerLink.yml` when available
 - `shellcheck test-assets/generate-keys.sh` when available
 
 ## Future Enhancements To Consider

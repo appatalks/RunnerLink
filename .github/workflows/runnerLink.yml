@@ -1,4 +1,4 @@
-name: SSH into GitHub Runner
+name: RunnerLink Gateway
 
 on:
   workflow_dispatch:

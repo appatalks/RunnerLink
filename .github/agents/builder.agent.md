@@ -38,7 +38,7 @@ Every user ask requires reviewer approval before Builder gives the final answer.
 This repository provides SSH access to GitHub-hosted runners through a Docker-based OpenSSH gateway and reverse SSH tunnels.
 - The gateway container is built from `Dockerfile` on Ubuntu 22.04 with OpenSSH server.
 - `docker-compose.yml` publishes host port 50556 to container port 50555 for gateway SSH and host port 2222 for the reverse tunnel endpoint.
-- `.github/workflows/debug-runner.yml` installs and configures SSH on the hosted runner, writes the user-provided public key, opens `ssh -R 2222:localhost:22`, and keeps the job alive for `MAX_LIFETIME`.
+- `.github/workflows/runnerLink.yml` installs and configures SSH on the hosted runner, writes the user-provided public key, opens `ssh -R 2222:localhost:22`, and keeps the job alive for `MAX_LIFETIME`.
 - `test-assets/generate-keys.sh` creates local test key material and should be treated as a development helper, not production secret management.
 - `README.md` is the user-facing contract for setup, router forwarding, GitHub secrets, workflow dispatch, connection commands, and troubleshooting.
 
