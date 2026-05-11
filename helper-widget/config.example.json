@@ -13,7 +13,7 @@
       "name": "main",
       "branch": "main",
       "tunnel_port": 2222,
-      "max_lifetime": 3600
+      "max_lifetime": 21600
     }
   ],
   "tools": [
@@ -39,7 +39,7 @@
       "target": "runner",
       "check": "if ! command -v az >/dev/null 2>&1; then echo 'not installed'; elif ! AZURE_CORE_NO_COLOR=1 az login --help >/dev/null 2>&1 || ! AZURE_CORE_NO_COLOR=1 az account get-access-token --help >/dev/null 2>&1; then echo 'needs setup'; else tmp_out=$(mktemp); tmp_err=$(mktemp); if AZURE_CORE_NO_COLOR=1 az account list --all >\"$tmp_out\" 2>\"$tmp_err\" && ! grep -qi 'please run .*az login' \"$tmp_err\" && { AZURE_CORE_NO_COLOR=1 az account tenant list >/dev/null 2>&1 || [ \"$(tr -d '[:space:]' < \"$tmp_out\")\" != \"[]\" ]; }; then echo 'azure ready'; else echo 'needs login'; fi; rm -f \"$tmp_out\" \"$tmp_err\"; fi",
       "install": "command -v curl >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y curl ca-certificates; }; if ! command -v az >/dev/null 2>&1 || ! AZURE_CORE_NO_COLOR=1 az login --help >/dev/null 2>&1 || ! AZURE_CORE_NO_COLOR=1 az account get-access-token --help >/dev/null 2>&1; then tmp_script=/tmp/install-azure-cli.sh; curl -fsSL https://aka.ms/InstallAzureCLIDeb -o \"$tmp_script\" && sudo bash \"$tmp_script\"; rm -f \"$tmp_script\"; fi; if ! AZURE_CORE_NO_COLOR=1 az version >/dev/null 2>&1 || ! AZURE_CORE_NO_COLOR=1 az login --help >/dev/null 2>&1 || ! AZURE_CORE_NO_COLOR=1 az account get-access-token --help >/dev/null 2>&1; then echo 'needs setup'; exit 1; fi; tmp_out=$(mktemp); tmp_err=$(mktemp); if AZURE_CORE_NO_COLOR=1 az account list --all >\"$tmp_out\" 2>\"$tmp_err\" && ! grep -qi 'please run .*az login' \"$tmp_err\" && { AZURE_CORE_NO_COLOR=1 az account tenant list >/dev/null 2>&1 || [ \"$(tr -d '[:space:]' < \"$tmp_out\")\" != \"[]\" ]; }; then echo 'azure ready'; else echo 'needs login'; fi; rm -f \"$tmp_out\" \"$tmp_err\"",
-      "auth": "az login --use-device-code --allow-no-subscriptions"
+      "auth": "az config set core.login_experience_v2=off 2>/dev/null; az login --use-device-code --allow-no-subscriptions"
     },
     {
       "id": "adx",
@@ -47,7 +47,7 @@
       "target": "runner",
       "check": "if ! command -v az >/dev/null 2>&1; then echo 'needs azure cli'; elif ! az extension show --name kusto >/dev/null 2>&1; then echo 'kusto missing'; else tmp_out=$(mktemp); tmp_err=$(mktemp); if AZURE_CORE_NO_COLOR=1 az account list --all >\"$tmp_out\" 2>\"$tmp_err\" && ! grep -qi 'please run .*az login' \"$tmp_err\" && { AZURE_CORE_NO_COLOR=1 az account tenant list >/dev/null 2>&1 || [ \"$(tr -d '[:space:]' < \"$tmp_out\")\" != \"[]\" ]; }; then echo 'adx ready'; else echo 'needs login'; fi; rm -f \"$tmp_out\" \"$tmp_err\"; fi",
       "install": "command -v az >/dev/null 2>&1 && AZURE_CORE_NO_COLOR=1 az login --help >/dev/null 2>&1 || { command -v curl >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y curl ca-certificates; }; tmp_script=/tmp/install-azure-cli.sh; curl -fsSL https://aka.ms/InstallAzureCLIDeb -o \"$tmp_script\" && sudo bash \"$tmp_script\"; rm -f \"$tmp_script\"; }; if ! AZURE_CORE_NO_COLOR=1 az version >/dev/null 2>&1; then echo 'needs azure cli'; exit 1; fi; az extension show --name kusto >/dev/null 2>&1 || az extension add --name kusto --yes >/dev/null 2>&1; if ! az extension show --name kusto >/dev/null 2>&1; then echo 'kusto missing'; exit 1; fi; tmp_out=$(mktemp); tmp_err=$(mktemp); if AZURE_CORE_NO_COLOR=1 az account list --all >\"$tmp_out\" 2>\"$tmp_err\" && ! grep -qi 'please run .*az login' \"$tmp_err\" && { AZURE_CORE_NO_COLOR=1 az account tenant list >/dev/null 2>&1 || [ \"$(tr -d '[:space:]' < \"$tmp_out\")\" != \"[]\" ]; }; then echo 'adx ready'; else echo 'needs login'; fi; rm -f \"$tmp_out\" \"$tmp_err\"",
-      "auth": "az login --use-device-code --allow-no-subscriptions"
+      "auth": "az config set core.login_experience_v2=off 2>/dev/null; az login --use-device-code --allow-no-subscriptions"
     }
   ]
 }

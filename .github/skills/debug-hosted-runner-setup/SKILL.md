@@ -142,17 +142,17 @@ ssh -i test-assets/id_rsa_test -p 2222 \
 
 Using `gh copilot` may require the runner to authenticate with a GitHub account or token that has Copilot access.
 
-## Helper Widget
+## RunnerLink
 
-Use the native Linux/macOS helper widget when the user wants a desktop control surface for the bridge, multiple runner workstreams, and modular tool auth checks.
+Use RunnerLink when the user wants a desktop control surface for direct access to Actions runners, multiple runner workstreams, and modular tool auth checks.
 
 ```bash
 python3 helper-widget/runner_widget.py
 ```
 
-The widget reads workstreams and tool modules from `helper-widget/config.example.json`, or from ignored local file `helper-widget/config.json` if present. Do not store tokens or passwords in either file. Interactive auth for GitHub, Copilot, Azure, or Azure Data Explorer should happen directly in a trusted terminal or selected runner shell.
+RunnerLink reads workstreams and tool modules from `helper-widget/config.example.json`, or from ignored local file `helper-widget/config.json` if present. Do not store tokens or passwords in either file. Interactive auth for GitHub, Copilot, Azure, or Azure Data Explorer should happen directly in a trusted terminal or selected runner shell.
 
-The default runner is `main` on reverse tunnel port `2222`. Use Add Runner in the widget to create additional named runners; names are normalized, ports are auto-assigned from `2222-2231`, the updated workstream list is saved atomically to ignored `helper-widget/config.json`, and the runner starts immediately. Auto-assigned ports are based on local config only, so probe after starting a runner to confirm the gateway port is free.
+The default runner is `main` on reverse tunnel port `2222`. Use Add Runner in RunnerLink to create additional named runners; names are normalized, ports are auto-assigned from `2222-2231`, the updated workstream list is saved atomically to ignored `helper-widget/config.json`, and the runner starts immediately. Auto-assigned ports are based on local config only, so probe after starting a runner to confirm the gateway port is free.
 
 Tool Setup remains non-interactive except for Copilot. Azure CLI and Azure Data Explorer Setup install or repair command modules only; Fix starts `az login --use-device-code --allow-no-subscriptions` in a runner shell and polls the selected runner until the check reports ready or a setup problem. Azure/ADX checks should print one friendly status line such as `azure ready`, `adx ready`, `needs login`, or `kusto missing`, never raw Azure JSON.
 
@@ -187,7 +187,7 @@ Current workflow runs supervise the reverse SSH tunnel and reconnect with capped
 
 - Add a wrapper script for setup, secret refresh, workflow run, and tunnel probing.
 - Add a cleanup script for canceling the run and stopping the gateway.
-- Package the helper widget as a macOS menu bar app or Linux tray app if the Python/Tk prototype becomes too limited.
+- Package RunnerLink as a macOS menu bar app or Linux tray app if the Python/Tk prototype becomes too limited.
 - Add `actionlint` and `shellcheck` to CI.
 - Add a short `TESTING.md` with local, public, and GitHub-runner verification paths.
 - Add a preflight command that reports firewall/router readiness without revealing public IPs.

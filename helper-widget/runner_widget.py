@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import os
 import pty
@@ -20,7 +22,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import tkinter as tk
-import tkinter.font as tkfont
 from tkinter import messagebox, simpledialog, ttk
 
 
@@ -33,6 +34,36 @@ TUNNEL_PORT_MAX = 2231
 ACTIVE_RUN_STATUSES = {"queued", "in_progress", "waiting", "requested", "pending"}
 COPILOT_SETUP_COMMAND = "gh copilot"
 TERMINAL_AUTH_MODULES = {"azure", "adx"}
+AZ_PROFILE_PATCH_SCRIPT = (
+    "if [ \"$(az account list --all 2>/dev/null | tr -d '[:space:]')\" = '[]' ]; then "
+    "echo '[widget] Profile empty after login — patching for no-subscription account...'; "
+    "tid=$(python3 -c \""
+    "import json, os; "
+    "p = os.path.expanduser('~/.azure/msal_token_cache.json'); "
+    "d = json.load(open(p)); "
+    "at = next(iter(d.get('AccessToken', {}).values()), {}); "
+    "print(at.get('realm', '').strip())\" 2>/dev/null); "
+    "if [ -z \"$tid\" ]; then tid=$(az rest --url https://graph.microsoft.com/v1.0/organization "
+    "--query 'value[0].id' -o tsv 2>/dev/null); fi; "
+    "if [ -n \"$tid\" ]; then "
+    "python3 -c \""
+    "import json, os; "
+    "p = os.path.expanduser('~/.azure/azureProfile.json'); "
+    "d = json.load(open(p)); "
+    "d['subscriptions'] = [{"
+    "'id': '00000000-0000-0000-0000-000000000000', "
+    "'name': 'No Subscription', "
+    "'state': 'Enabled', "
+    "'tenantId': '$tid', "
+    "'isDefault': True, "
+    "'environmentName': 'AzureCloud', "
+    "'user': {'name': 'device-code', 'type': 'user'}"
+    "}]; "
+    "json.dump(d, open(p, 'w'), indent=2)\" "
+    "&& echo '[widget] Profile patched — az commands should work now'; "
+    "else echo '[widget] Could not determine tenant ID — manual patching may be needed'; fi; "
+    "fi"
+)
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:\][^\a]*(?:\a|\x1B\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])")
 THEME = {
     "app_bg": "#0b1120",
@@ -260,6 +291,15 @@ class WidgetConfig:
     tools: list[ToolModule]
 
 
+@dataclass
+class _TerminalSlot:
+    """Per-workstream embedded terminal state."""
+    frame: tk.Frame
+    process: subprocess.Popen[Any] | None = None
+    session_id: int = 0
+    launch_after_id: str | None = None
+
+
 class ToolTip:
     def __init__(self, widget: tk.Widget, text: str) -> None:
         self.widget = widget
@@ -326,12 +366,12 @@ def load_config() -> WidgetConfig:
             name=str(item["name"]),
             branch=str(item.get("branch", "main")),
             tunnel_port=int(item["tunnel_port"]),
-            max_lifetime=int(item.get("max_lifetime", 3600)),
+            max_lifetime=int(item.get("max_lifetime", 21600)),
         )
         for item in raw_config.get("workstreams", [])
     ]
     if not workstreams:
-        workstreams = [Workstream(name="main", branch="main", tunnel_port=2222, max_lifetime=3600)]
+        workstreams = [Workstream(name="main", branch="main", tunnel_port=2222, max_lifetime=21600)]
     tools = [
         ToolModule(
             module_id=str(item["id"]),
@@ -425,6 +465,56 @@ def is_unexpected_tunnel_port_input(error: CommandError) -> bool:
     return "Unexpected inputs provided" in output and "TUNNEL_PORT" in output
 
 
+def _x11_resize_and_focus(parent_wid: int, width: int, height: int, *, focus: bool = False) -> bool:
+    """Resize all X11 children of *parent_wid* to *width*×*height* and optionally focus the first child."""
+    try:
+        lib = ctypes.util.find_library("X11")
+        if not lib:
+            return False
+        x11 = ctypes.cdll.LoadLibrary(lib)
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+
+        # Install a no-op error handler so BadMatch from XSetInputFocus
+        # on unmapped windows doesn't kill the process.
+        _XErrorHandler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte))
+        _noop_handler = _XErrorHandler(lambda _dpy, _ev: 0)
+        x11.XSetErrorHandler.restype = _XErrorHandler
+        x11.XSetErrorHandler.argtypes = [_XErrorHandler]
+        old_handler = x11.XSetErrorHandler(_noop_handler)
+
+        dpy = x11.XOpenDisplay(None)
+        if not dpy:
+            x11.XSetErrorHandler(old_handler)
+            return False
+        try:
+            root_ret = ctypes.c_ulong()
+            parent_ret = ctypes.c_ulong()
+            children = ctypes.POINTER(ctypes.c_ulong)()
+            nchildren = ctypes.c_uint()
+            x11.XQueryTree(
+                ctypes.c_void_p(dpy),
+                ctypes.c_ulong(parent_wid),
+                ctypes.byref(root_ret),
+                ctypes.byref(parent_ret),
+                ctypes.byref(children),
+                ctypes.byref(nchildren),
+            )
+            ok = nchildren.value > 0
+            for i in range(nchildren.value):
+                x11.XMoveResizeWindow(ctypes.c_void_p(dpy), children[i], 0, 0, width, height)
+            if focus and nchildren.value > 0:
+                x11.XSetInputFocus(ctypes.c_void_p(dpy), children[0], 2, 0)  # RevertToParent, CurrentTime
+            x11.XSync(ctypes.c_void_p(dpy), False)
+            if nchildren.value:
+                x11.XFree(children)
+            return ok
+        finally:
+            x11.XCloseDisplay(ctypes.c_void_p(dpy))
+            x11.XSetErrorHandler(old_handler)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class RunnerWidget:
     def __init__(self, root: tk.Tk, config: WidgetConfig) -> None:
         self.root = root
@@ -432,12 +522,12 @@ class RunnerWidget:
         self.events: queue.Queue[Callable[[], None]] = queue.Queue()
         self.bridge_enabled = tk.BooleanVar(value=False)
         self.selected_workstream = tk.StringVar(value=config.workstreams[0].name if config.workstreams else "")
-        self.selected_session = tk.StringVar(value="")
         self.workflow_sessions: dict[str, WorkflowSession] = {}
-        self.session_picker: ttk.Combobox | None = None
         self.workstream_enabled: dict[str, tk.BooleanVar] = {}
         self.workstream_status: dict[str, tk.StringVar] = {}
         self.workstream_status_lights: dict[str, tk.Canvas] = {}
+        self.workstream_timer_vars: dict[str, tk.StringVar] = {}
+        self.workstream_timer_labels: dict[str, tk.Label] = {}
         self.tool_enabled: dict[str, tk.BooleanVar] = {}
         self.tool_status: dict[str, tk.StringVar] = {}
         self.tool_status_lights: dict[str, tk.Canvas] = {}
@@ -445,11 +535,9 @@ class RunnerWidget:
         self.bridge_status_light: tk.Canvas | None = None
         self.shell_process: subprocess.Popen[Any] | None = None
         self.shell_master_fd: int | None = None
-        self.embedded_terminal_process: subprocess.Popen[Any] | None = None
-        self.embedded_terminal_session_id = 0
-        self.embedded_terminal_launch_after_id: str | None = None
-        self.embedded_terminal_frame: tk.Frame | None = None
+        self.terminal_slots: dict[str, _TerminalSlot] = {}
         self.embedded_terminal_workstream: str | None = None
+        self.embedded_terminal_panel: ttk.Frame | None = None
         self.shell_session_id = 0
         self.shell_status = tk.StringVar(value="disconnected")
         self.last_tool_failure: dict[str, str] = {}
@@ -462,8 +550,16 @@ class RunnerWidget:
         self.workstream_picker: ttk.Combobox | None = None
         self.shell_workstream_picker: ttk.Combobox | None = None
         self.auth_poll_generations: dict[str, int] = {}
+        self.files_tab: ttk.Frame | None = None
+        self.files_tree: ttk.Treeview | None = None
+        self.files_path_var = tk.StringVar(value="/home/runner")
+        self.files_status_var = tk.StringVar(value="")
+        self.files_workstream_picker: ttk.Combobox | None = None
+        self.files_loaded_nodes: set[str] = set()
+        self.files_node_paths: dict[str, tuple[str, bool]] = {}
+        self.files_menu: tk.Menu | None = None
 
-        self.root.title("Runner Bridge")
+        self.root.title("RunnerLink")
         self.root.geometry("860x620")
         self.root.minsize(760, 520)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -472,6 +568,7 @@ class RunnerWidget:
         self.build_layout()
         self.root.after(100, self.drain_events)
         self.root.after(1000, self.refresh_sessions)
+        self.root.after(5000, self._update_timers)
 
     def configure_style(self) -> None:
         style = ttk.Style()
@@ -480,7 +577,7 @@ class RunnerWidget:
         self.root.configure(background=THEME["app_bg"])
         style.configure("TFrame", background=THEME["app_bg"])
         style.configure("Panel.TFrame", background=THEME["panel_bg"], relief="flat")
-        style.configure("Title.TLabel", background=THEME["app_bg"], foreground=THEME["text"], font=("TkDefaultFont", 15, "bold"))
+        style.configure("Title.TLabel", background=THEME["app_bg"], foreground="#5eead4", font=("Helvetica", 16, "bold"))
         style.configure("Subtitle.TLabel", background=THEME["app_bg"], foreground=THEME["muted"], font=("TkDefaultFont", 10))
         style.configure("Section.TLabel", background=THEME["panel_bg"], foreground=THEME["text"], font=("TkDefaultFont", 11, "bold"))
         style.configure("Muted.TLabel", background=THEME["panel_bg"], foreground=THEME["muted"], font=("TkDefaultFont", 9))
@@ -498,6 +595,28 @@ class RunnerWidget:
         style.configure("TCheckbutton", background=THEME["panel_bg"], foreground=THEME["text"])
         style.map("TCheckbutton", background=[("active", THEME["panel_bg"])], foreground=[("active", THEME["text"])])
         style.configure("TMenubutton", background=THEME["panel_alt"], foreground=THEME["text"])
+        style.configure("Files.Treeview", background=THEME["activity_bg"], foreground=THEME["activity_fg"], fieldbackground=THEME["activity_bg"], borderwidth=0, rowheight=22)
+        style.configure("Files.Treeview.Heading", background=THEME["panel_alt"], foreground=THEME["text"])
+        style.map("Files.Treeview", background=[("selected", THEME["primary_fill"])], foreground=[("selected", THEME["primary_line"])])
+        style.configure("Warning.TLabel", background="#78350f", foreground="#fbbf24", font=("TkDefaultFont", 10, "bold"))
+
+    def _draw_logo(self, parent: ttk.Frame) -> None:
+        """Draw a modern RunnerLink logo: a running figure with a link/chain arc."""
+        size = 32
+        c = tk.Canvas(parent, width=size, height=size, highlightthickness=0, borderwidth=0, background=THEME["app_bg"])
+        c.pack(side="left")
+        teal = "#5eead4"
+        cyan = "#22d3ee"
+        # Running figure
+        c.create_oval(11, 2, 17, 8, outline=teal, width=1.6)  # head
+        c.create_line(14, 8, 14, 18, fill=teal, width=1.8)  # torso
+        c.create_line(14, 12, 9, 16, fill=teal, width=1.6)  # left arm
+        c.create_line(14, 12, 20, 9, fill=teal, width=1.6)  # right arm forward
+        c.create_line(14, 18, 9, 25, fill=teal, width=1.6)  # left leg back
+        c.create_line(14, 18, 20, 24, fill=teal, width=1.6)  # right leg forward
+        # Link arc (connection / tunnel)
+        c.create_arc(18, 6, 30, 22, start=40, extent=260, outline=cyan, width=2, style="arc")
+        c.create_oval(27, 7, 31, 11, outline=cyan, width=1.4)  # link endpoint dot
 
     def build_layout(self) -> None:
         outer = ttk.Frame(self.root, padding=8)
@@ -505,7 +624,9 @@ class RunnerWidget:
 
         header = ttk.Frame(outer)
         header.pack(fill="x", pady=(0, 8))
-        ttk.Label(header, text="Runner Bridge", style="Title.TLabel").pack(side="left")
+        self._draw_logo(header)
+        ttk.Label(header, text="RunnerLink", style="Title.TLabel").pack(side="left", padx=(6, 0))
+        ttk.Label(header, text="Your only Actions gateway", style="Subtitle.TLabel").pack(side="left", padx=(10, 0), pady=(4, 0))
 
         notebook = ttk.Notebook(outer)
         notebook.pack(fill="both", expand=True)
@@ -513,9 +634,12 @@ class RunnerWidget:
 
         controls_tab = ttk.Frame(notebook, padding=8)
         shell_tab = ttk.Frame(notebook, padding=0)
+        files_tab = ttk.Frame(notebook, padding=0)
         self.shell_tab = shell_tab
+        self.files_tab = files_tab
         notebook.add(controls_tab, text="Controls")
         notebook.add(shell_tab, text="Shell")
+        notebook.add(files_tab, text="Files")
 
         controls_tab.rowconfigure(0, weight=1)
         controls_tab.columnconfigure(0, weight=1)
@@ -534,7 +658,9 @@ class RunnerWidget:
         self.build_tools_panel(control_stack)
         self.build_log_panel(activity_rail, compact=True)
         self.build_shell_panel(shell_tab)
+        self.build_files_panel(files_tab)
         self.log("Ready. Config loaded from config.json or config.example.json.")
+        self.selected_workstream.trace_add("write", self.on_workstream_changed)
 
     def workstream_names(self) -> list[str]:
         return [workstream.name for workstream in self.config.workstreams]
@@ -543,7 +669,7 @@ class RunnerWidget:
         names = self.workstream_names()
         if self.selected_workstream.get() not in names:
             self.selected_workstream.set(names[0] if names else "")
-        for picker in (self.workstream_picker, self.shell_workstream_picker):
+        for picker in (self.workstream_picker, self.shell_workstream_picker, self.files_workstream_picker):
             if picker is not None:
                 picker.configure(values=names)
 
@@ -645,6 +771,16 @@ class RunnerWidget:
             canvas.create_arc(7, 7, 19, 19, start=35, extent=285, outline=color, width=1.5)
             canvas.create_line(18, 7, 18, 12, fill=color, width=1.5)
             canvas.create_line(18, 7, 13, 8, fill=color, width=1.5)
+        elif icon == "clipboard_copy":
+            canvas.create_rectangle(8, 9, 15, 17, outline=color, width=1.3)
+            canvas.create_rectangle(11, 7, 18, 15, outline=color, width=1.3)
+            canvas.create_line(10, 7, 10, 5, fill=color, width=1.2)
+            canvas.create_line(10, 5, 16, 5, fill=color, width=1.2)
+        elif icon == "clipboard_paste":
+            canvas.create_rectangle(7, 7, 19, 19, outline=color, width=1.3)
+            canvas.create_line(10, 11, 16, 11, fill=color, width=1.3)
+            canvas.create_line(10, 14, 16, 14, fill=color, width=1.3)
+            canvas.create_line(10, 17, 14, 17, fill=color, width=1.3)
         else:
             canvas.create_oval(11, 11, 15, 15, fill=color, outline=color)
 
@@ -719,6 +855,7 @@ class RunnerWidget:
         top_row.pack(fill="x")
         ttk.Label(top_row, text="2. Runners", style="Section.TLabel").pack(side="left")
         ttk.Button(top_row, text="Add Runner", command=self.add_workstream).pack(side="right")
+        self.icon_button(top_row, "reconnect", self.refresh_sessions, "Refresh active workflow sessions", "primary").pack(side="right", padx=(0, 4))
         ttk.Label(top_row, text="tool target", style="Muted.TLabel").pack(side="right", padx=(8, 6))
         self.workstream_picker = ttk.Combobox(
             top_row,
@@ -732,15 +869,6 @@ class RunnerWidget:
         self.workstreams_rows_frame = ttk.Frame(panel, style="Panel.TFrame")
         self.workstreams_rows_frame.pack(fill="x")
         self.build_workstream_rows()
-
-        session_row = ttk.Frame(panel, style="Panel.TFrame")
-        session_row.pack(fill="x", pady=(8, 0))
-        ttk.Label(session_row, text="sessions", style="Muted.TLabel", width=9).pack(side="left")
-        self.session_picker = ttk.Combobox(session_row, textvariable=self.selected_session, values=(), state="readonly", width=38)
-        self.session_picker.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        self.icon_button(session_row, "reconnect", self.refresh_sessions, "Refresh running workflow sessions", "primary").pack(side="left", padx=2)
-        self.icon_button(session_row, "terminal", self.resume_selected_session, "Resume selected session using the selected workstream port").pack(side="left", padx=2)
-        self.icon_button(session_row, "stop", self.cancel_selected_session, "Cancel selected workflow session", "danger").pack(side="left", padx=2)
         self.update_workstream_pickers()
 
     def build_workstream_rows(self) -> None:
@@ -753,12 +881,24 @@ class RunnerWidget:
                 self.workstream_enabled[workstream.name] = tk.BooleanVar(value=False)
             if workstream.name not in self.workstream_status:
                 self.workstream_status[workstream.name] = tk.StringVar(value="idle")
+            if workstream.name not in self.workstream_timer_vars:
+                self.workstream_timer_vars[workstream.name] = tk.StringVar(value="")
             row = ttk.Frame(self.workstreams_rows_frame, style="Panel.TFrame")
             row.pack(fill="x", pady=(5, 0))
             self.workstream_status_lights[workstream.name] = self.status_light(row)
             self.workstream_status_lights[workstream.name].pack(side="left", padx=(0, 5))
             ttk.Label(row, text=f"{workstream.name}:{workstream.tunnel_port}", style="Muted.TLabel", width=17).pack(side="left")
             ttk.Label(row, textvariable=self.workstream_status[workstream.name], style="Status.TLabel", width=16).pack(side="left")
+            timer_lbl = tk.Label(
+                row,
+                textvariable=self.workstream_timer_vars[workstream.name],
+                font=("Monospace", 8, "bold"),
+                background=THEME["panel_bg"],
+                foreground=THEME["muted"],
+                padx=4,
+            )
+            timer_lbl.pack(side="left", padx=(2, 4))
+            self.workstream_timer_labels[workstream.name] = timer_lbl
             self.icon_button(
                 row,
                 "probe",
@@ -776,7 +916,7 @@ class RunnerWidget:
                 row,
                 "stop",
                 lambda item=workstream: self.cancel_workstream(item),
-                f"Cancel {workstream.name} workflow run",
+                f"Terminate {workstream.name} session",
                 "danger",
             ).pack(side="left", padx=2)
             self.update_status_light(self.workstream_status_lights[workstream.name], self.workstream_status[workstream.name].get())
@@ -809,7 +949,7 @@ class RunnerWidget:
         if port is None:
             messagebox.showwarning("Add Runner", f"No free tunnel ports remain in {TUNNEL_PORT_MIN}-{TUNNEL_PORT_MAX}.", parent=self.root)
             return
-        workstream = Workstream(name=name, branch="main", tunnel_port=port, max_lifetime=3600)
+        workstream = Workstream(name=name, branch="main", tunnel_port=port, max_lifetime=21600)
         self.config.workstreams.append(workstream)
         self.selected_workstream.set(name)
         self.workstream_enabled[name] = tk.BooleanVar(value=False)
@@ -822,6 +962,26 @@ class RunnerWidget:
             messagebox.showerror("Add Runner", f"Runner added for this session, but config.json could not be saved: {error}", parent=self.root)
         self.log(f"Added runner {name} on port {port}; starting it now. Port was auto-assigned from local config.")
         self.start_workstream(workstream)
+
+    def remove_workstream(self, name: str) -> None:
+        self.config.workstreams = [ws for ws in self.config.workstreams if ws.name != name]
+        self.workstream_enabled.pop(name, None)
+        self.workstream_status.pop(name, None)
+        self.workstream_status_lights.pop(name, None)
+        self.workstream_timer_vars.pop(name, None)
+        self.workstream_timer_labels.pop(name, None)
+        if name in self.terminal_slots:
+            self.disconnect_embedded_terminal(log_message=False, name=name)
+            slot = self.terminal_slots.pop(name, None)
+            if slot:
+                slot.frame.destroy()
+        self.build_workstream_rows()
+        self.update_workstream_pickers()
+        try:
+            self.save_local_config()
+        except OSError:
+            pass
+        self.log(f"Removed runner {name}")
 
     def build_tools_panel(self, parent: ttk.Frame) -> None:
         panel = self.panel(parent)
@@ -863,15 +1023,12 @@ class RunnerWidget:
             self.shell_workstream_picker.pack(side="right")
             ttk.Label(top, text="target", style="Muted.TLabel").pack(side="right", padx=(0, 6))
 
-        self.embedded_terminal_frame = tk.Frame(
-            panel,
-            borderwidth=0,
-            highlightthickness=0,
-            relief="flat",
-            background=THEME["activity_bg"],
-        )
-        self.embedded_terminal_frame.grid(row=1, column=0, sticky="nsew")
-        self.embedded_terminal_frame.grid_remove()
+        self.embedded_terminal_panel = ttk.Frame(panel, style="Panel.TFrame")
+        self.embedded_terminal_panel.grid(row=1, column=0, sticky="nsew")
+        self.embedded_terminal_panel.grid_remove()
+        self.embedded_terminal_panel.rowconfigure(0, weight=1)
+        self.embedded_terminal_panel.columnconfigure(0, weight=1)
+        self.build_embedded_terminal_context_menu()
 
         self.shell_text = tk.Text(
             panel,
@@ -901,8 +1058,11 @@ class RunnerWidget:
         bottom.columnconfigure(0, weight=1)
         ttk.Label(bottom, text="Docked terminal with external fallback", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         self.icon_button(bottom, "terminal", self.open_embedded_terminal_shell, "Dock runner SSH inside the app", "primary").grid(row=0, column=1, padx=2)
-        self.icon_button(bottom, "connect", self.open_system_terminal_shell, "Open runner SSH in a local terminal window").grid(row=0, column=2, padx=2)
-        self.icon_button(bottom, "stop", self.disconnect_embedded_terminal, "Close docked terminal", "danger").grid(row=0, column=3, padx=2)
+        self.icon_button(bottom, "reconnect", self.redock_embedded_terminal, "Redock terminal at current window size").grid(row=0, column=2, padx=2)
+        self.icon_button(bottom, "connect", self.open_system_terminal_shell, "Open runner SSH in a local terminal window").grid(row=0, column=3, padx=2)
+        self.icon_button(bottom, "clipboard_copy", self.copy_from_embedded_terminal, "Copy selection from terminal").grid(row=0, column=4, padx=2)
+        self.icon_button(bottom, "clipboard_paste", self.paste_to_embedded_terminal, "Paste clipboard into terminal").grid(row=0, column=5, padx=2)
+        self.icon_button(bottom, "stop", self.disconnect_embedded_terminal, "Close docked terminal", "danger").grid(row=0, column=6, padx=2)
 
         self.append_shell("Choose a runner, then dock a terminal inside the app for a full interactive shell.\n")
 
@@ -994,6 +1154,338 @@ class RunnerWidget:
         else:
             self.append_shell("Shell display cleared.\n")
 
+    # ── File Explorer ──────────────────────────────────────────────
+
+    def build_files_panel(self, parent: ttk.Frame) -> None:
+        panel = ttk.Frame(parent, style="Panel.TFrame", padding=6)
+        panel.pack(fill="both", expand=True)
+        panel.rowconfigure(1, weight=1)
+        panel.columnconfigure(0, weight=1)
+
+        top = ttk.Frame(panel, style="Panel.TFrame")
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        top.columnconfigure(1, weight=1)
+        ttk.Label(top, text="Files", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        path_entry = ttk.Entry(top, textvariable=self.files_path_var, font=("Monospace", 9))
+        path_entry.grid(row=0, column=1, sticky="ew", padx=(10, 6))
+        path_entry.bind("<Return>", lambda _event: self.files_navigate())
+        if self.config.workstreams:
+            self.files_workstream_picker = ttk.Combobox(
+                top,
+                textvariable=self.selected_workstream,
+                values=self.workstream_names(),
+                state="readonly",
+                width=18,
+            )
+            self.files_workstream_picker.grid(row=0, column=2, sticky="e")
+
+        tree_frame = ttk.Frame(panel, style="Panel.TFrame")
+        tree_frame.grid(row=1, column=0, sticky="nsew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+
+        columns = ("size", "perms", "modified")
+        tree = ttk.Treeview(tree_frame, columns=columns, selectmode="browse", style="Files.Treeview")
+        tree.heading("#0", text="Name", anchor="w")
+        tree.heading("size", text="Size", anchor="e")
+        tree.heading("perms", text="Permissions", anchor="w")
+        tree.heading("modified", text="Modified", anchor="w")
+        tree.column("#0", minwidth=200, width=340, stretch=True)
+        tree.column("size", minwidth=60, width=80, stretch=False, anchor="e")
+        tree.column("perms", minwidth=80, width=100, stretch=False)
+        tree.column("modified", minwidth=100, width=160, stretch=False)
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        tree.bind("<<TreeviewOpen>>", self.files_on_expand)
+        tree.bind("<Double-1>", self.files_on_double_click)
+        tree.bind("<Button-3>", self.files_show_context_menu)
+        self.files_tree = tree
+        self.build_files_context_menu()
+
+        bottom = ttk.Frame(panel, style="Panel.TFrame")
+        bottom.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        bottom.columnconfigure(0, weight=1)
+        ttk.Label(bottom, textvariable=self.files_status_var, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        self.icon_button(bottom, "reconnect", self.files_navigate, "Refresh directory listing", "primary").grid(row=0, column=1, padx=2)
+        self.icon_button(bottom, "copy", self.files_download_selected, "Download selected file to local machine").grid(row=0, column=2, padx=2)
+        self.icon_button(bottom, "setup", self.files_navigate_up, "Go to parent directory").grid(row=0, column=3, padx=2)
+
+    def build_files_context_menu(self) -> None:
+        self.files_menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            background=THEME["panel_alt"],
+            foreground=THEME["text"],
+            activebackground=THEME["neutral_fill"],
+            activeforeground=THEME["text"],
+            borderwidth=1,
+        )
+        self.files_menu.add_command(label="Download", command=self.files_download_selected)
+        self.files_menu.add_command(label="Open Directory", command=self.files_open_selected_dir)
+        self.files_menu.add_separator()
+        self.files_menu.add_command(label="Refresh", command=self.files_navigate)
+        self.files_menu.add_command(label="Go Up", command=self.files_navigate_up)
+
+    def files_show_context_menu(self, event: tk.Event[Any]) -> str:
+        tree = self.files_tree
+        if tree is None or self.files_menu is None:
+            return "break"
+        node_id = tree.identify_row(event.y)
+        if node_id:
+            tree.selection_set(node_id)
+        is_dir = self.files_is_dir_node(node_id) if node_id else False
+        is_file = bool(node_id) and not is_dir
+        self.files_menu.entryconfigure(0, state="normal" if is_file else "disabled")
+        self.files_menu.entryconfigure(1, state="normal" if is_dir else "disabled")
+        try:
+            self.files_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.files_menu.grab_release()
+        return "break"
+
+    def files_open_selected_dir(self) -> None:
+        tree = self.files_tree
+        if tree is None:
+            return
+        selection = tree.selection()
+        if not selection:
+            return
+        node_id = selection[0]
+        entry = self.files_node_paths.get(node_id)
+        if not entry or not entry[1]:
+            return
+        self.files_path_var.set(entry[0])
+        self.files_navigate()
+
+    def files_navigate(self) -> None:
+        path = self.files_path_var.get().strip()
+        if not path:
+            path = "/home/runner"
+            self.files_path_var.set(path)
+        self.files_status_var.set("loading...")
+        self.run_background(
+            f"List {path}",
+            lambda: self.files_list_remote(path),
+            on_done=lambda result: self.files_populate_root(path, result),
+            on_error=lambda detail: self.files_status_var.set(f"error: {detail[:80]}"),
+        )
+
+    def files_navigate_up(self) -> None:
+        current = self.files_path_var.get().strip().rstrip("/")
+        parent = current.rsplit("/", 1)[0] or "/"
+        self.files_path_var.set(parent)
+        self.files_navigate()
+
+    def files_list_remote(self, path: str) -> str:
+        workstream = self.selected_workstream_item()
+        safe_path = shlex.quote(path)
+        command = f"ls -laF --time-style=long-iso {safe_path} 2>/dev/null || ls -laF {safe_path}"
+        result = self.run_on_runner(workstream, command, timeout=30)
+        return result.stdout
+
+    def files_parse_ls(self, output: str) -> list[dict[str, str]]:
+        entries: list[dict[str, str]] = []
+        for line in output.strip().splitlines():
+            if line.startswith("total ") or not line.strip():
+                continue
+            parts = line.split(None, 8)
+            if len(parts) < 7:
+                continue
+            perms = parts[0]
+            size = parts[4]
+            is_long_iso = bool(re.match(r"\d{4}-\d{2}-\d{2}", parts[5]))
+            if is_long_iso:
+                modified = f"{parts[5]} {parts[6]}" if len(parts) >= 8 else parts[5]
+                name_raw = parts[7] if len(parts) >= 8 else parts[6]
+            else:
+                modified = f"{parts[5]} {parts[6]} {parts[7]}" if len(parts) >= 9 else f"{parts[5]} {parts[6]}"
+                name_raw = parts[8] if len(parts) >= 9 else (parts[7] if len(parts) >= 8 else parts[6])
+            name = name_raw.rstrip("@/|*=>")
+            if name in (".", ".."):
+                continue
+            is_dir = perms.startswith("d") or name_raw.endswith("/")
+            is_link = perms.startswith("l")
+            display_name = name
+            if " -> " in display_name:
+                display_name = display_name.split(" -> ")[0]
+            entries.append({
+                "name": display_name,
+                "size": size if not is_dir else "",
+                "perms": perms,
+                "modified": modified,
+                "is_dir": "1" if is_dir else "0",
+                "is_link": "1" if is_link else "0",
+            })
+        entries.sort(key=lambda entry: (entry["is_dir"] != "1", entry["name"].lower()))
+        return entries
+
+    def files_populate_root(self, path: str, ls_output: str) -> None:
+        tree = self.files_tree
+        if tree is None:
+            return
+        self.files_loaded_nodes.clear()
+        self.files_node_paths.clear()
+        for item in tree.get_children(""):
+            tree.delete(item)
+
+        entries = self.files_parse_ls(ls_output)
+        base = path.rstrip("/") or "/"
+        for entry in entries:
+            child_path = f"{base}/{entry['name']}" if base != "/" else f"/{entry['name']}"
+            prefix = "\U0001f4c1 " if entry["is_dir"] == "1" else "\U0001f4c4 "
+            if entry["is_link"] == "1":
+                prefix = "\U0001f517 "
+            node_id = tree.insert(
+                "",
+                "end",
+                text=f"{prefix}{entry['name']}",
+                values=(entry["size"], entry["perms"], entry["modified"]),
+                open=False,
+            )
+            self.files_node_paths[node_id] = (child_path, entry["is_dir"] == "1")
+            if entry["is_dir"] == "1":
+                tree.insert(node_id, "end", text="loading...")
+
+        count = len(entries)
+        self.files_status_var.set(f"{count} item{'s' if count != 1 else ''} in {base}")
+        self.log(f"Files: listed {count} items in {base}")
+
+    def files_on_expand(self, event: tk.Event[Any]) -> None:
+        tree = self.files_tree
+        if tree is None:
+            return
+        node_id = tree.focus()
+        if not node_id or node_id in self.files_loaded_nodes:
+            return
+        self.files_loaded_nodes.add(node_id)
+        for child in tree.get_children(node_id):
+            tree.delete(child)
+
+        entry = self.files_node_paths.get(node_id)
+        dir_path = entry[0] if entry else ""
+        if not dir_path:
+            return
+        self.files_status_var.set(f"loading {dir_path}...")
+        self.run_background(
+            f"List {dir_path}",
+            lambda: self.files_list_remote(dir_path),
+            on_done=lambda result: self.files_populate_children(node_id, dir_path, result),
+            on_error=lambda detail: self.files_status_var.set(f"error: {detail[:80]}"),
+        )
+
+    def files_populate_children(self, parent_id: str, parent_path: str, ls_output: str) -> None:
+        tree = self.files_tree
+        if tree is None:
+            return
+        for child in tree.get_children(parent_id):
+            tree.delete(child)
+
+        entries = self.files_parse_ls(ls_output)
+        base = parent_path.rstrip("/") or "/"
+        for entry in entries:
+            child_path = f"{base}/{entry['name']}" if base != "/" else f"/{entry['name']}"
+            prefix = "\U0001f4c1 " if entry["is_dir"] == "1" else "\U0001f4c4 "
+            if entry["is_link"] == "1":
+                prefix = "\U0001f517 "
+            node_id = tree.insert(
+                parent_id,
+                "end",
+                text=f"{prefix}{entry['name']}",
+                values=(entry["size"], entry["perms"], entry["modified"]),
+                open=False,
+            )
+            self.files_node_paths[node_id] = (child_path, entry["is_dir"] == "1")
+            if entry["is_dir"] == "1":
+                tree.insert(node_id, "end", text="loading...")
+
+        count = len(entries)
+        self.files_status_var.set(f"{count} item{'s' if count != 1 else ''} in {base}")
+
+    def files_is_dir_node(self, node_id: str) -> bool:
+        entry = self.files_node_paths.get(node_id)
+        return entry[1] if entry else False
+
+    def files_on_double_click(self, event: tk.Event[Any]) -> None:
+        tree = self.files_tree
+        if tree is None:
+            return
+        node_id = tree.identify_row(event.y)
+        if not node_id:
+            return
+        entry = self.files_node_paths.get(node_id)
+        if not entry:
+            return
+        if self.files_is_dir_node(node_id):
+            return
+        self.files_download_node(node_id, entry[0])
+
+    def files_download_selected(self) -> None:
+        tree = self.files_tree
+        if tree is None:
+            return
+        selection = tree.selection()
+        if not selection:
+            self.files_status_var.set("select a file first")
+            return
+        node_id = selection[0]
+        entry = self.files_node_paths.get(node_id)
+        if not entry:
+            self.files_status_var.set("cannot resolve path")
+            return
+        if self.files_is_dir_node(node_id):
+            self.files_status_var.set("select a file, not a directory")
+            return
+        self.files_download_node(node_id, entry[0])
+
+    def files_download_node(self, node_id: str, remote_path: str) -> None:
+        downloads_dir = (REPO_ROOT / "downloads").resolve()
+        downloads_dir.mkdir(exist_ok=True)
+        filename = remote_path.rsplit("/", 1)[-1]
+        if not filename or filename in (".", ".."):
+            self.files_status_var.set("invalid filename")
+            return
+        local_path = (downloads_dir / filename).resolve()
+        if not str(local_path).startswith(str(downloads_dir)):
+            self.files_status_var.set("invalid filename")
+            return
+        counter = 1
+        while local_path.exists() and counter <= 999:
+            stem = filename.rsplit(".", 1)
+            if len(stem) == 2:
+                local_path = (downloads_dir / f"{stem[0]}_{counter}.{stem[1]}").resolve()
+            else:
+                local_path = (downloads_dir / f"{filename}_{counter}").resolve()
+            counter += 1
+
+        self.files_status_var.set(f"downloading {filename}...")
+        self.log(f"Files: downloading {remote_path} → {local_path}")
+
+        def action() -> str:
+            workstream = self.selected_workstream_item()
+            scp_args = [
+                "scp",
+                "-i", str(self.private_key_path()),
+                "-P", str(workstream.tunnel_port),
+                "-o", "BatchMode=yes",
+                "-o", "IdentitiesOnly=yes",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "LogLevel=ERROR",
+                f"runner@localhost:{shlex.quote(remote_path)}",
+                str(local_path),
+            ]
+            run_process(scp_args, timeout=120)
+            return f"saved {filename} to {local_path}"
+
+        self.run_background(
+            f"Download {filename}",
+            action,
+            on_done=lambda result: self.files_status_var.set(result),
+            on_error=lambda detail: self.files_status_var.set(f"download failed: {detail[:80]}"),
+        )
+
     def build_log_panel(self, parent: ttk.Frame, compact: bool = False) -> None:
         panel = parent if compact else ttk.Frame(parent, style="Panel.TFrame", padding=8)
         if not compact:
@@ -1026,6 +1518,46 @@ class RunnerWidget:
     def enqueue(self, event: Callable[[], None]) -> None:
         self.events.put(event)
 
+    def _update_timers(self) -> None:
+        """Update countdown timers for each workstream based on linked session created_at."""
+        now = time.time()
+        for workstream in self.config.workstreams:
+            timer_var = self.workstream_timer_vars.get(workstream.name)
+            timer_lbl = self.workstream_timer_labels.get(workstream.name)
+            if not timer_var or not timer_lbl:
+                continue
+            session = self.active_session_for_run(workstream.run_id) if workstream.run_id else None
+            if not session or not session.created_at:
+                timer_var.set("")
+                continue
+            try:
+                created = session.created_at.replace("Z", "+00:00")
+                from datetime import datetime, timezone
+                start_ts = datetime.fromisoformat(created).timestamp()
+            except (ValueError, OSError):
+                timer_var.set("")
+                continue
+            elapsed = now - start_ts
+            remaining = workstream.max_lifetime - elapsed
+            if remaining <= 0:
+                timer_var.set("expired")
+                timer_lbl.configure(foreground="#ef4444", background="#450a0a")
+            elif remaining < 900:  # <15 min
+                mins = int(remaining // 60)
+                secs = int(remaining % 60)
+                timer_var.set(f"\u26a0 {mins:02d}:{secs:02d}")
+                timer_lbl.configure(foreground="#ef4444", background="#450a0a")
+            elif remaining < 3600:  # <1 hour
+                mins = int(remaining // 60)
+                timer_var.set(f"\u26a0 {mins}m left")
+                timer_lbl.configure(foreground="#fbbf24", background="#78350f")
+            else:
+                hours = int(remaining // 3600)
+                mins = int((remaining % 3600) // 60)
+                timer_var.set(f"{hours}h{mins:02d}m")
+                timer_lbl.configure(foreground=THEME["muted"], background=THEME["panel_bg"])
+        self.root.after(10000, self._update_timers)
+
     def log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
         entry = f"[{timestamp}] {message}\n"
@@ -1054,7 +1586,7 @@ class RunnerWidget:
         self.shell_text.see("end")
 
     def on_close(self) -> None:
-        self.disconnect_embedded_terminal(log_message=False)
+        self.disconnect_all_embedded_terminals()
         self.disconnect_shell(log_message=False)
         self.root.destroy()
 
@@ -1147,26 +1679,171 @@ class RunnerWidget:
     def embedded_terminal_available(self) -> bool:
         return sys.platform.startswith("linux") and bool(os.environ.get("DISPLAY")) and shutil.which("xterm") is not None
 
-    def cancel_pending_embedded_terminal_launch(self) -> None:
-        if self.embedded_terminal_launch_after_id is None:
+    def _get_or_create_slot(self, name: str) -> _TerminalSlot:
+        """Get or create a per-workstream terminal slot with its own X11 frame."""
+        if name in self.terminal_slots:
+            return self.terminal_slots[name]
+        if self.embedded_terminal_panel is None:
+            raise RuntimeError("No embedded terminal panel")
+        frame = tk.Frame(
+            self.embedded_terminal_panel,
+            borderwidth=0,
+            highlightthickness=0,
+            relief="flat",
+            background=THEME["activity_bg"],
+        )
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.grid_remove()
+        frame.bind("<Configure>", self._on_terminal_frame_configure)
+        slot = _TerminalSlot(frame=frame)
+        self.terminal_slots[name] = slot
+        return slot
+
+    def _active_slot(self) -> _TerminalSlot | None:
+        """Return the terminal slot for the currently selected workstream, if any."""
+        name = self.embedded_terminal_workstream
+        return self.terminal_slots.get(name) if name else None
+
+    def _slot_is_running(self, slot: _TerminalSlot | None) -> bool:
+        return slot is not None and slot.process is not None and slot.process.poll() is None
+
+    def cancel_pending_embedded_terminal_launch(self, name: str | None = None) -> None:
+        if name:
+            slot = self.terminal_slots.get(name)
+            if slot and slot.launch_after_id is not None:
+                try:
+                    self.root.after_cancel(slot.launch_after_id)
+                except tk.TclError:
+                    pass
+                slot.launch_after_id = None
             return
-        try:
-            self.root.after_cancel(self.embedded_terminal_launch_after_id)
-        except tk.TclError:
-            pass
-        self.embedded_terminal_launch_after_id = None
+        for slot in self.terminal_slots.values():
+            if slot.launch_after_id is not None:
+                try:
+                    self.root.after_cancel(slot.launch_after_id)
+                except tk.TclError:
+                    pass
+                slot.launch_after_id = None
 
     def show_shell_text(self) -> None:
-        if self.embedded_terminal_frame is not None:
-            self.embedded_terminal_frame.grid_remove()
+        if self.embedded_terminal_panel is not None:
+            self.embedded_terminal_panel.grid_remove()
+        for slot in self.terminal_slots.values():
+            slot.frame.grid_remove()
         if hasattr(self, "shell_text"):
             self.shell_text.grid(row=1, column=0, sticky="nsew")
 
-    def show_embedded_terminal_frame(self) -> None:
+    def show_embedded_terminal_frame(self, name: str | None = None) -> None:
         if hasattr(self, "shell_text"):
             self.shell_text.grid_remove()
-        if self.embedded_terminal_frame is not None:
-            self.embedded_terminal_frame.grid(row=1, column=0, sticky="nsew")
+        # Hide all slot frames first
+        for slot in self.terminal_slots.values():
+            slot.frame.grid_remove()
+        # Show the panel and the requested slot
+        if self.embedded_terminal_panel is not None:
+            self.embedded_terminal_panel.grid(row=1, column=0, sticky="nsew")
+        if name:
+            slot = self.terminal_slots.get(name)
+            if slot:
+                slot.frame.grid(row=0, column=0, sticky="nsew")
+
+    def _fit_embedded_xterm(self, *, focus: bool = False, name: str | None = None) -> None:
+        """Resize the embedded xterm to fill its parent frame and optionally focus it."""
+        target = name or self.embedded_terminal_workstream
+        if not target:
+            return
+        slot = self.terminal_slots.get(target)
+        if not slot or not self._slot_is_running(slot):
+            return
+        # Skip if the frame is not currently visible (e.g. on another tab)
+        if not slot.frame.winfo_ismapped():
+            return
+        w = slot.frame.winfo_width()
+        h = slot.frame.winfo_height()
+        if w > 1 and h > 1:
+            _x11_resize_and_focus(slot.frame.winfo_id(), w, h, focus=focus)
+
+    def _on_terminal_frame_configure(self, _event: tk.Event | None = None) -> None:
+        """Debounced handler for terminal frame <Configure> events."""
+        if hasattr(self, "_terminal_resize_after_id"):
+            try:
+                self.root.after_cancel(self._terminal_resize_after_id)
+            except tk.TclError:
+                pass
+        self._terminal_resize_after_id = self.root.after(100, self._fit_embedded_xterm)
+
+    def build_embedded_terminal_context_menu(self) -> None:
+        self.embedded_terminal_menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            background=THEME["panel_alt"],
+            foreground=THEME["text"],
+            activebackground=THEME["neutral_fill"],
+            activeforeground=THEME["text"],
+            borderwidth=1,
+        )
+        self.embedded_terminal_menu.add_command(label="Copy", command=self.copy_from_embedded_terminal)
+        self.embedded_terminal_menu.add_command(label="Paste", command=self.paste_to_embedded_terminal)
+        self.embedded_terminal_menu.add_separator()
+        self.embedded_terminal_menu.add_command(label="Redock", command=self.redock_embedded_terminal)
+        self.embedded_terminal_menu.add_command(label="Disconnect", command=self.disconnect_embedded_terminal)
+
+    def _show_embedded_terminal_menu(self, event: tk.Event | None = None) -> str:
+        if self.embedded_terminal_menu is None:
+            return "break"
+        has_clipboard = False
+        try:
+            has_clipboard = bool(self.root.clipboard_get())
+        except tk.TclError:
+            pass
+        running = self.embedded_terminal_is_running()
+        self.embedded_terminal_menu.entryconfigure("Paste", state="normal" if has_clipboard and running else "disabled")
+        self.embedded_terminal_menu.entryconfigure("Redock", state="normal" if running else "disabled")
+        self.embedded_terminal_menu.entryconfigure("Disconnect", state="normal" if running else "disabled")
+        if event:
+            self.embedded_terminal_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def copy_from_embedded_terminal(self) -> None:
+        """Read the CLIPBOARD selection (auto-copied by xterm on mouse select)."""
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            text = ""
+        if text:
+            self.log("Copied from terminal clipboard")
+        else:
+            self.log("No text selected — highlight text in the terminal first")
+
+    def paste_to_embedded_terminal(self) -> None:
+        """Send clipboard text to the embedded xterm via xdotool."""
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            self.log("Clipboard is empty")
+            return
+        if not text:
+            self.log("Clipboard is empty")
+            return
+        slot = self._active_slot()
+        if not self._slot_is_running(slot):
+            self.log("No docked terminal to paste into")
+            return
+        assert slot is not None
+        wid = slot.frame.winfo_id()
+        if shutil.which("xdotool"):
+            try:
+                subprocess.Popen(
+                    ["xdotool", "key", "--window", str(wid), "ctrl+shift+v"],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self.log("Pasted into terminal")
+            except Exception:  # noqa: BLE001
+                self.log("Paste failed — press Ctrl+Shift+V in the terminal")
+        else:
+            self.log("Install xdotool for button paste — use Ctrl+Shift+V in the terminal")
 
     def terminal_script(self, ssh_command: str) -> str:
         return (
@@ -1213,27 +1890,7 @@ class RunnerWidget:
                 return args
         return None
 
-    def embedded_terminal_geometry(self) -> str:
-        if self.embedded_terminal_frame is None:
-            return "80x24+0+0"
-        width = self.embedded_terminal_frame.winfo_width()
-        height = self.embedded_terminal_frame.winfo_height()
-        if width <= 1:
-            width = 820
-        if height <= 1:
-            height = 420
-        try:
-            font = tkfont.Font(root=self.root, family="Monospace", size=10)
-            cell_width = max(6, font.measure("M"))
-            cell_height = max(12, font.metrics("linespace"))
-        except tk.TclError:
-            cell_width = 8
-            cell_height = 18
-        columns = max(72, min(160, max(1, (width - 12) // cell_width)))
-        rows = max(8, min(48, max(1, (height - 16) // cell_height)))
-        return f"{columns}x{rows}+0+0"
-
-    def embedded_terminal_args(self, ssh_command: str, window_id: int, geometry: str | None = None) -> list[str]:
+    def embedded_terminal_args(self, ssh_command: str, window_id: int) -> list[str]:
         script = self.terminal_script(ssh_command)
         shell = os.environ.get("SHELL") or "/bin/sh"
         return [
@@ -1261,11 +1918,16 @@ class RunnerWidget:
             "-xrm",
             "*borderWidth: 0",
             "-xrm",
+            "*allowWindowOps: true",
+            "-xrm",
             "*selectToClipboard: true",
             "-xrm",
-            "*VT100.Translations: #override\nCtrl Shift <Key>C: copy-selection(CLIPBOARD)\nCtrl Shift <Key>V: insert-selection(CLIPBOARD)\nShift <Key>Insert: insert-selection(CLIPBOARD)",
-            "-geometry",
-            geometry or "80x24+0+0",
+            "*VT100.Translations: #override\n"
+            "Ctrl Shift <Key>C: copy-selection(CLIPBOARD)\n"
+            "Ctrl Shift <Key>V: insert-selection(CLIPBOARD)\n"
+            "Shift <Key>Insert: insert-selection(CLIPBOARD)\n"
+            "~Ctrl ~Shift ~Meta <Btn3Up>: insert-selection(CLIPBOARD)\n"
+            "~Ctrl ~Shift ~Meta <Btn2Up>: insert-selection(CLIPBOARD, PRIMARY, CUT_BUFFER0)",
             "-e",
             shell,
             "-lc",
@@ -1329,51 +1991,64 @@ class RunnerWidget:
         self.shell_text.focus_set()
         threading.Thread(target=self.read_shell_output, args=(session_id, master_fd, process), daemon=True).start()
 
-    def embedded_terminal_is_running(self) -> bool:
-        return self.embedded_terminal_process is not None and self.embedded_terminal_process.poll() is None
+    def embedded_terminal_is_running(self, name: str | None = None) -> bool:
+        target = name or self.embedded_terminal_workstream
+        if not target:
+            return False
+        slot = self.terminal_slots.get(target)
+        return self._slot_is_running(slot)
 
     def open_embedded_terminal_shell(
         self,
         command_to_copy: str | None = None,
         remote_command: str | None = None,
+        switch_tab: bool = True,
     ) -> None:
-        if self.notebook is not None and self.shell_tab is not None:
+        if switch_tab and self.notebook is not None and self.shell_tab is not None:
             self.notebook.select(self.shell_tab)
         if command_to_copy:
             self.root.clipboard_clear()
             self.root.clipboard_append(command_to_copy)
         workstream = self.selected_workstream_item()
-        if self.embedded_terminal_is_running():
+        name = workstream.name
+        existing_slot = self.terminal_slots.get(name)
+        slot_running = self._slot_is_running(existing_slot)
+        if slot_running:
             if remote_command:
                 clipboard_command = command_to_copy or remote_command
                 self.root.clipboard_clear()
                 self.root.clipboard_append(clipboard_command)
-                active_name = self.embedded_terminal_workstream or "active"
-                self.shell_status.set(f"docked:{active_name}")
+                self.shell_status.set(f"docked:{name}")
                 self.log(f"Copied {clipboard_command} for the active docked terminal")
+                self.show_embedded_terminal_frame(name)
+                self.embedded_terminal_workstream = name
                 return
             if command_to_copy:
-                active_name = self.embedded_terminal_workstream or "active"
-                self.shell_status.set(f"docked:{active_name}")
+                self.shell_status.set(f"docked:{name}")
                 self.log("Command copied to clipboard for the active docked terminal")
+                self.show_embedded_terminal_frame(name)
+                self.embedded_terminal_workstream = name
                 return
-            if self.embedded_terminal_workstream == workstream.name:
-                self.shell_status.set(f"docked:{workstream.name}")
-                return
-        if not self.embedded_terminal_available() or self.embedded_terminal_frame is None:
+            # Already running for this workstream — just show it
+            self.show_embedded_terminal_frame(name)
+            self.embedded_terminal_workstream = name
+            self.shell_status.set(f"docked:{name}")
+            self.root.after(50, lambda: self._fit_embedded_xterm(focus=True, name=name))
+            return
+        if not self.embedded_terminal_available() or self.embedded_terminal_panel is None:
             self.append_shell("Docked terminal is unavailable here; opening a local terminal window instead.\n")
             self.open_system_terminal_shell(command_to_copy=command_to_copy)
             return
 
         self.disconnect_shell(log_message=False)
-        self.cancel_pending_embedded_terminal_launch()
-        if self.embedded_terminal_is_running():
-            self.disconnect_embedded_terminal(log_message=False)
+        self.cancel_pending_embedded_terminal_launch(name)
 
+        slot = self._get_or_create_slot(name)
         ssh_command = self.interactive_ssh_command(workstream, remote_command)
-        self.show_embedded_terminal_frame()
-        self.shell_status.set(f"docking:{workstream.name}")
-        self.embedded_terminal_launch_after_id = self.root.after(
+        self.embedded_terminal_workstream = name
+        self.show_embedded_terminal_frame(name)
+        self.shell_status.set(f"docking:{name}")
+        slot.launch_after_id = self.root.after(
             75,
             lambda: self.launch_embedded_terminal_process(workstream, ssh_command, command_to_copy),
         )
@@ -1384,20 +2059,23 @@ class RunnerWidget:
         ssh_command: str,
         command_to_copy: str | None = None,
     ) -> None:
-        self.embedded_terminal_launch_after_id = None
-        if self.embedded_terminal_frame is None:
+        name = workstream.name
+        slot = self.terminal_slots.get(name)
+        if slot:
+            slot.launch_after_id = None
+        if not slot:
             self.show_shell_text()
             self.open_system_terminal_shell(command_to_copy=command_to_copy)
             return
         self.root.update_idletasks()
-        self.embedded_terminal_frame.update_idletasks()
-        window_id = self.embedded_terminal_frame.winfo_id()
-        geometry = self.embedded_terminal_geometry()
+        slot.frame.update_idletasks()
+        window_id = slot.frame.winfo_id()
         try:
             process = subprocess.Popen(
-                self.embedded_terminal_args(ssh_command, window_id, geometry),
+                self.embedded_terminal_args(ssh_command, window_id),
                 cwd=REPO_ROOT,
                 start_new_session=True,
+                stderr=subprocess.DEVNULL,
             )
         except Exception as error:  # noqa: BLE001 - GUI boundary should show launch failures.
             self.show_shell_text()
@@ -1406,48 +2084,94 @@ class RunnerWidget:
             self.open_system_terminal_shell(command_to_copy=command_to_copy)
             return
 
-        self.embedded_terminal_session_id += 1
-        session_id = self.embedded_terminal_session_id
-        self.embedded_terminal_process = process
-        self.embedded_terminal_workstream = workstream.name
-        self.shell_status.set(f"docked:{workstream.name}")
-        self.append_shell(f"Docked terminal for {workstream.name} on port {workstream.tunnel_port}.\n")
+        slot.session_id += 1
+        session_id = slot.session_id
+        slot.process = process
+        self.embedded_terminal_workstream = name
+        self.shell_status.set(f"docked:{name}")
+        self.append_shell(f"Docked terminal for {name} on port {workstream.tunnel_port}.\n")
         if command_to_copy:
             self.append_shell("Command copied to clipboard. Paste it in the docked terminal when the runner prompt is ready.\n")
-        self.log(f"Docked terminal for {workstream.name}")
-        threading.Thread(target=self.wait_for_embedded_terminal, args=(session_id, process), daemon=True).start()
+        self.log(f"Docked terminal for {name}")
+        self.root.after(300, lambda: self._fit_embedded_xterm(focus=True, name=name))
+        threading.Thread(target=self.wait_for_embedded_terminal, args=(name, session_id, process), daemon=True).start()
 
-    def wait_for_embedded_terminal(self, session_id: int, process: subprocess.Popen[Any]) -> None:
+    def wait_for_embedded_terminal(self, name: str, session_id: int, process: subprocess.Popen[Any]) -> None:
         process.wait()
-        self.enqueue(lambda session_id=session_id: self.mark_embedded_terminal_disconnected(session_id))
+        self.enqueue(lambda: self.mark_embedded_terminal_disconnected(name, session_id))
 
-    def mark_embedded_terminal_disconnected(self, session_id: int) -> None:
-        if session_id != self.embedded_terminal_session_id:
+    def mark_embedded_terminal_disconnected(self, name: str, session_id: int) -> None:
+        slot = self.terminal_slots.get(name)
+        if not slot or session_id != slot.session_id:
             return
-        self.embedded_terminal_process = None
-        self.embedded_terminal_workstream = None
-        self.show_shell_text()
-        if not self.shell_is_connected():
-            self.shell_status.set("disconnected")
+        slot.process = None
+        if self.embedded_terminal_workstream == name:
+            self.show_shell_text()
+            if not self.shell_is_connected():
+                self.shell_status.set("disconnected")
 
-    def disconnect_embedded_terminal(self, log_message: bool = True) -> None:
-        self.cancel_pending_embedded_terminal_launch()
-        process = self.embedded_terminal_process
-        self.embedded_terminal_session_id += 1
-        if process and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
-        self.embedded_terminal_process = None
-        self.embedded_terminal_workstream = None
-        self.show_shell_text()
-        if not self.shell_is_connected():
-            self.shell_status.set("disconnected")
+    def disconnect_embedded_terminal(self, log_message: bool = True, name: str | None = None) -> None:
+        target = name or self.embedded_terminal_workstream
+        if target:
+            self.cancel_pending_embedded_terminal_launch(target)
+            slot = self.terminal_slots.get(target)
+            if slot:
+                slot.session_id += 1
+                process = slot.process
+                if process and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=2)
+                slot.process = None
+        if self.embedded_terminal_workstream == target:
+            self.embedded_terminal_workstream = None
+            self.show_shell_text()
+            if not self.shell_is_connected():
+                self.shell_status.set("disconnected")
         if log_message and hasattr(self, "shell_text"):
             self.append_shell("Docked terminal closed.\n")
+
+    def disconnect_all_embedded_terminals(self) -> None:
+        for name in list(self.terminal_slots):
+            self.disconnect_embedded_terminal(log_message=False, name=name)
+
+    def redock_embedded_terminal(self) -> None:
+        name = self.embedded_terminal_workstream
+        if not self.embedded_terminal_is_running():
+            self.open_embedded_terminal_shell()
+            return
+        self.disconnect_embedded_terminal(log_message=False)
+        if name:
+            self.selected_workstream.set(name)
+        self.append_shell("Redocking terminal at current window size...\n")
+        self.root.after(100, self.open_embedded_terminal_shell)
+
+    def on_workstream_changed(self, *_args: Any) -> None:
+        new_name = self.selected_workstream.get()
+        old_name = self.embedded_terminal_workstream
+        if old_name and new_name != old_name:
+            # Check if the new workstream already has a running terminal
+            new_slot = self.terminal_slots.get(new_name)
+            if self._slot_is_running(new_slot):
+                # Just swap visibility — preserve both sessions
+                self.embedded_terminal_workstream = new_name
+                self.show_embedded_terminal_frame(new_name)
+                self.shell_status.set(f"docked:{new_name}")
+                self.root.after(50, lambda: self._fit_embedded_xterm(focus=True, name=new_name))
+            elif self._slot_is_running(self.terminal_slots.get(old_name)):
+                # Old terminal is running but new one isn't — hide old, show text
+                self.embedded_terminal_workstream = None
+                self.show_shell_text()
+                self.shell_status.set("disconnected")
+                self.append_shell(f"Target changed to {new_name}. Dock a terminal to connect.\n")
+        self.check_all_tools()
+
+    def check_all_tools(self) -> None:
+        for tool in self.config.tools:
+            self.check_tool(tool)
 
     def open_system_terminal_shell(self, command_to_copy: str | None = None, remote_command: str | None = None) -> None:
         if self.notebook is not None and self.shell_tab is not None:
@@ -1536,16 +2260,20 @@ class RunnerWidget:
         self.open_embedded_terminal_shell(command_to_copy=command)
 
     def open_auth_command_shell(self, tool: ToolModule) -> None:
-        # Poll the runner that launched the login even if the picker changes later.
+        # Auth commands need an interactive terminal session; kill any
+        # existing docked terminal for this workstream so we get a
+        # fresh SSH with the auth command baked into the remote shell.
         workstream = self.selected_workstream_item()
-        remote_command = f"{tool.auth}; exec ${{SHELL:-/bin/bash}} -l"
-        if self.embedded_terminal_is_running():
-            self.open_system_terminal_shell(command_to_copy=tool.auth, remote_command=remote_command)
-        else:
-            self.open_embedded_terminal_shell(command_to_copy=tool.auth, remote_command=remote_command)
+        if self.embedded_terminal_is_running(workstream.name):
+            self.disconnect_embedded_terminal(log_message=False, name=workstream.name)
+        auth_steps = tool.auth
+        if tool.module_id in TERMINAL_AUTH_MODULES:
+            auth_steps = f"{auth_steps}; {AZ_PROFILE_PATCH_SCRIPT}"
+        remote_command = f"{auth_steps}; exec ${{SHELL:-/bin/bash}} -l"
+        self.open_embedded_terminal_shell(command_to_copy=tool.auth, remote_command=remote_command)
         self.set_tool_status(tool.module_id, "continue login")
         self.start_auth_polling(tool, workstream)
-        self.log(f"Opened {tool.label} login shell. Continue the prompt in the terminal.")
+        self.log(f"Opened {tool.label} login shell. The auth command will run automatically on connect.")
 
     def open_copilot_setup_shell(self) -> None:
         remote_command = f"{COPILOT_SETUP_COMMAND}; exec ${{SHELL:-/bin/bash}} -l"
@@ -1755,28 +2483,27 @@ class RunnerWidget:
         def action() -> str:
             if not workstream.run_id:
                 return "no captured run ID"
-            run_process(["gh", "run", "cancel", workstream.run_id], timeout=60)
-            return f"cancel requested for {workstream.run_id}"
+            try:
+                run_process(["gh", "run", "cancel", workstream.run_id], timeout=60)
+            except CommandError as error:
+                combined = f"{error.stdout}\n{error.stderr}"
+                if "completed" in combined.lower() or "is not in progress" in combined.lower():
+                    return f"already completed {workstream.run_id}"
+                raise
+            return f"terminated {workstream.run_id}"
 
         def done(result: str) -> None:
-            self.workstream_enabled[workstream.name].set(False)
-            workstream.run_id = ""
-            workstream.run_url = ""
-            self.set_workstream_status(workstream.name, result)
+            name = workstream.name
+            self.remove_workstream(name)
             self.root.after(500, self.refresh_sessions)
 
-        self.set_workstream_status(workstream.name, "canceling")
+        self.set_workstream_status(workstream.name, "terminating")
         self.run_background(
-            f"Cancel {workstream.name}",
+            f"Terminate {workstream.name}",
             action,
             done,
             lambda _detail: self.set_workstream_status(workstream.name, "failed"),
         )
-
-    def session_label(self, session: WorkflowSession) -> str:
-        title = session.title or "workflow run"
-        branch = session.branch or "branch?"
-        return self.compact_status(f"{session.run_id} {session.status} {branch} {title}", 58)
 
     def refresh_sessions(self) -> None:
         def action() -> str:
@@ -1804,7 +2531,6 @@ class RunnerWidget:
 
         def done(result: str) -> None:
             runs = json.loads(result)
-            labels: list[str] = []
             self.workflow_sessions.clear()
             for run in runs:
                 session = WorkflowSession(
@@ -1817,23 +2543,29 @@ class RunnerWidget:
                 )
                 if not session.run_id:
                     continue
-                label = self.session_label(session)
-                suffix = 2
-                unique_label = label
-                while unique_label in self.workflow_sessions:
-                    unique_label = self.compact_status(f"{label} #{suffix}", 58)
-                    suffix += 1
-                self.workflow_sessions[unique_label] = session
-                labels.append(unique_label)
-            if self.session_picker is not None:
-                self.session_picker.configure(values=labels)
-            self.selected_session.set(labels[0] if labels else "")
-            self.log(f"Sessions refreshed: {len(labels)} active")
+                self.workflow_sessions[session.run_id] = session
+            self.auto_link_sessions()
+            self.log(f"Sessions refreshed: {len(self.workflow_sessions)} active")
 
         self.run_background("Refresh sessions", action, done)
 
-    def selected_session_item(self) -> WorkflowSession | None:
-        return self.workflow_sessions.get(self.selected_session.get())
+    def auto_link_sessions(self) -> None:
+        claimed_run_ids = {ws.run_id for ws in self.config.workstreams if ws.run_id}
+        sessions = list(self.workflow_sessions.values())
+        for workstream in self.config.workstreams:
+            if workstream.run_id:
+                continue
+            branch_sessions = [
+                s for s in sessions
+                if s.branch == workstream.branch and s.run_id not in claimed_run_ids
+            ]
+            if len(branch_sessions) == 1:
+                session = branch_sessions[0]
+                workstream.run_id = session.run_id
+                workstream.run_url = session.url
+                claimed_run_ids.add(session.run_id)
+                self.set_workstream_status(workstream.name, f"linked {session.run_id}")
+                self.log(f"Auto-linked {workstream.name} to run {session.run_id}")
 
     def active_session_for_run(self, run_id: str) -> WorkflowSession | None:
         if not run_id:
@@ -1842,49 +2574,6 @@ class RunnerWidget:
             if session.run_id == run_id:
                 return session
         return None
-
-    def workstream_for_session(self, session: WorkflowSession) -> Workstream:
-        selected = self.selected_workstream_item()
-        matches = [workstream for workstream in self.config.workstreams if workstream.branch == session.branch]
-        if selected in matches or len(matches) != 1:
-            return selected
-        return matches[0]
-
-    def resume_selected_session(self) -> None:
-        session = self.selected_session_item()
-        if session is None:
-            self.log("No active workflow session selected")
-            return
-        workstream = self.workstream_for_session(session)
-        self.selected_workstream.set(workstream.name)
-        workstream.run_id = session.run_id
-        workstream.run_url = session.url
-        self.workstream_enabled[workstream.name].set(True)
-        self.set_workstream_status(workstream.name, f"run {session.run_id} resumed")
-        self.log(f"Resumed run {session.run_id} on {workstream.name}:{workstream.tunnel_port}")
-        self.open_embedded_terminal_shell()
-        self.probe_workstream(workstream)
-
-    def cancel_selected_session(self) -> None:
-        session = self.selected_session_item()
-        if session is None:
-            self.log("No active workflow session selected")
-            return
-
-        def action() -> str:
-            run_process(["gh", "run", "cancel", session.run_id], timeout=60)
-            return f"cancel requested for {session.run_id}"
-
-        def done(result: str) -> None:
-            for workstream in self.config.workstreams:
-                if workstream.run_id == session.run_id:
-                    self.workstream_enabled[workstream.name].set(False)
-                    workstream.run_id = ""
-                    workstream.run_url = ""
-                    self.set_workstream_status(workstream.name, result)
-            self.root.after(500, self.refresh_sessions)
-
-        self.run_background("Cancel session", action, done)
 
     def probe_failure_status(self, detail: str) -> str:
         lower_detail = detail.lower()
@@ -1903,12 +2592,29 @@ class RunnerWidget:
         if current_status is not None and current_status.get().startswith("starting"):
             self.log(f"{workstream.name} runner is already starting")
             return
-        if not workstream.run_id:
-            self.set_workstream_status(workstream.name, f"starting {workstream.name}")
-            self.log(f"No linked run for {workstream.name}; starting a new {workstream.name} runner.")
-            self.start_workstream(workstream)
+        if workstream.run_id:
+            self.probe_workstream(workstream)
             return
-        self.probe_workstream(workstream)
+        # No run_id — probe the port first; only start a new run if unreachable.
+        def action() -> str:
+            completed = self.run_on_runner(workstream, "echo runner-ok && whoami && hostname && pwd", timeout=40)
+            return completed.stdout.strip().replace("\n", " / ")
+
+        def done(result: str) -> None:
+            self.set_workstream_status(workstream.name, result)
+            self.log(f"{workstream.name} is reachable on port {workstream.tunnel_port} (no linked run_id; use Resume Session to link).")
+
+        def failed(detail: str) -> None:
+            status = self.probe_failure_status(detail)
+            if status in ("port closed", "gateway down"):
+                self.set_workstream_status(workstream.name, f"starting {workstream.name}")
+                self.log(f"{workstream.name} port {workstream.tunnel_port} is not reachable; starting a new runner.")
+                self.start_workstream(workstream)
+            else:
+                self.set_workstream_status(workstream.name, status)
+
+        self.set_workstream_status(workstream.name, "probing")
+        self.run_background(f"Probe {workstream.name}", action, done, failed)
 
     def probe_workstream(self, workstream: Workstream) -> None:
         def action() -> str:

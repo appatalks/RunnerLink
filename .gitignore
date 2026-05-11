@@ -6,3 +6,4 @@ helper-widget/config.json
 helper-widget/.state.json
 __pycache__/
 *.py[cod]
+downloads/

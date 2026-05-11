@@ -1,6 +1,6 @@
-# Runner Bridge Helper Widget
+# RunnerLink
 
-This is a small native Linux/macOS helper widget for managing the debug runner bridge from the desktop. It uses Python and Tk, so it does not need a web server or packaging step for local development.
+RunnerLink is a native Linux/macOS desktop app for direct access to GitHub Actions runners via reverse-SSH tunnels. It uses Python and Tk, so it does not need a web server or packaging step.
 
 ## Run
 

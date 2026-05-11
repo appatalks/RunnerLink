@@ -114,7 +114,7 @@ ssh -i test-assets/id_rsa_test -p 50556 -o IdentitiesOnly=yes gateway@localhost
 ### Multiple runner workstreams
 - Start each workflow run with a unique `TUNNEL_PORT` in the published range, such as 2222, 2223, or 2224.
 - Connect to the matching port for that runner: `ssh -p 2223 runner@...`
-- The helper widget in `helper-widget/` can launch, probe, and cancel workstreams from a small native Linux/macOS UI.
+- RunnerLink (`helper-widget/`) can launch, probe, and cancel workstreams from a native Linux/macOS desktop UI.
 
 ### Workflow tunnel fails to establish
 - Verify GitHub Secrets are set correctly
@@ -150,15 +150,15 @@ The SSH server is configured with:
 - Public key authentication only (no passwords)
 - User: `gateway`
 
-## Helper Widget
+## RunnerLink
 
-Run the native Linux/macOS helper widget locally:
+Run RunnerLink locally:
 
 ```bash
 python3 helper-widget/runner_widget.py
 ```
 
-The widget provides toggles for the Docker bridge, multiple runner workstreams, and modular tool auth checks for GitHub, GitHub Copilot CLI, Azure CLI, and Azure Data Explorer. Customize workstreams and tool modules by copying `helper-widget/config.example.json` to `helper-widget/config.json`.
+RunnerLink provides direct access to GitHub Actions runners with multiple workstreams, docked terminal sessions, file explorer, and modular tool auth for GitHub CLI, Copilot, Azure CLI, and Azure Data Explorer. Customize workstreams and tool modules by copying `helper-widget/config.example.json` to `helper-widget/config.json`.
 
 ## Screenshot
 
